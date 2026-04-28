@@ -1,0 +1,95 @@
+profile: prod_gb10
+experiment: v3_hero
+
+model:
+  name: Qwen/Qwen2.5-VL-7B-Instruct
+  torch_dtype: bf16
+  attn_implementation: sdpa
+  freeze_vit: true
+  freeze_merger: true
+  unfreeze_vit_last_n: 0
+
+lora:
+  enabled: true
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  bias: none
+
+aux:
+  proj_dim: 256
+  pooler_type: attention
+  pooler_num_heads: 8
+  proj_hidden: 1024
+  tag_init: chinese_clip
+  chinese_clip_model: OFA-Sys/chinese-clip-vit-base-patch16
+  freeze_tag_base: true
+
+contrastive:
+  enabled: true
+  lambda_value: 0.2
+  lambda_schedule: warmup
+  lambda_warmup_ratio: 0.1
+  lambda_anneal_ratio: 0.0
+  lambda_floor: 0.0
+  tau: 0.07
+  negatives_per_image: 256
+  neg_sampling: uniform
+  hard_neg_refresh_every_steps: 200
+
+caption:
+  enabled: true
+  max_caption_tokens: 384
+  label_smoothing: 0.0
+
+data:
+  train_manifest: data/splits/train.jsonl
+  val_manifest: data/splits/dev.jsonl
+  test_manifests:
+    test_id: data/splits/test_id.jsonl
+    test_source_holdout: data/splits/test_source_holdout.jsonl
+    test_cultural_hard: data/splits/test_cultural_hard.jsonl
+  vocab_path: data/vocab/vocab_T_v1.json
+  image_root: data/raw/images
+  max_pixels: 802816
+  min_pixels: 200704
+  num_workers: 4
+  pin_memory: true
+
+optim:
+  lr_lora: 0.0002
+  lr_aux: 0.001
+  weight_decay_lora: 0.0
+  weight_decay_aux: 0.05
+  weight_decay_tag_proj: 0.1
+  optimizer: adamw
+  scheduler: cosine
+  warmup_ratio: 0.05
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+training:
+  num_epochs: 3
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 16
+  gradient_checkpointing: true
+  seed: 42
+  eval_steps: 500
+  save_steps: 1000
+  logging_steps: 20
+  save_total_limit: 3
+  early_stopping_patience: 0
+
+device:
+  auto_detect: true
+  force: null
+  mixed_precision: bf16
+
+logging:
+  backend: tensorboard
+  project: formosa-dual
+  run_name: null
+  output_dir: outputs/default

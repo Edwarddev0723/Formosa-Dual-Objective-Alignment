@@ -1,0 +1,8 @@
+contrastive:
+  enabled: true
+  tau: 0.05
+caption:
+  enabled: true
+logging:
+  run_name: ablation_tau_0.05
+  output_dir: outputs/ablation_tau_0.05

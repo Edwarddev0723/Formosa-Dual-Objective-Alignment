@@ -1,0 +1,14 @@
+# V0 is evaluated via eval/zero_shot.py, not train_dual.py.
+# This config exists only for --dry-run validation completeness.
+# NOTE: caption.enabled=false + contrastive.enabled=false would normally
+# fail the at_least_one_loss_enabled validator. train_dual.py bypasses that
+# validator (logs a warning instead) when --dry-run is used for v0.
+caption:
+  enabled: false
+contrastive:
+  enabled: false
+training:
+  num_epochs: 0
+logging:
+  run_name: v0_zero_shot
+  output_dir: outputs/v0_zero_shot

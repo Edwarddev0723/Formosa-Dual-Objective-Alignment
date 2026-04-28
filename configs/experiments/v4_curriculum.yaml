@@ -1,0 +1,17 @@
+contrastive:
+  enabled: true
+  lambda_value: 0.2
+caption:
+  enabled: true
+data:
+  curriculum:
+    enabled: true
+    schedule:
+      - {phase: warm_start,    max_difficulty: 2, sampling_weight: 1.0, ratio: 0.20}
+      - {phase: expansion,     max_difficulty: 3, sampling_weight: 1.0, ratio: 0.20}
+      - {phase: hardening,     max_difficulty: 4, sampling_weight: 1.2, ratio: 0.20}
+      - {phase: cultural_peak, max_difficulty: 5, sampling_weight: 1.5, ratio: 0.20}
+      - {phase: consolidation, max_difficulty: 5, sampling_weight: 1.0, ratio: 0.20}
+logging:
+  run_name: v4_curriculum
+  output_dir: outputs/v4_curriculum

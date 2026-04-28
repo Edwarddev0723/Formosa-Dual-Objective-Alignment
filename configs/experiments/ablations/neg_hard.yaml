@@ -1,0 +1,9 @@
+contrastive:
+  enabled: true
+  neg_sampling: hard
+  hard_neg_refresh_every_steps: 200
+caption:
+  enabled: true
+logging:
+  run_name: ablation_neg_hard
+  output_dir: outputs/ablation_neg_hard

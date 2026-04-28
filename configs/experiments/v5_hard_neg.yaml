@@ -1,0 +1,10 @@
+contrastive:
+  enabled: true
+  lambda_value: 0.2
+  neg_sampling: hard
+  hard_neg_refresh_every_steps: 200
+caption:
+  enabled: true
+logging:
+  run_name: v5_hard_neg
+  output_dir: outputs/v5_hard_neg

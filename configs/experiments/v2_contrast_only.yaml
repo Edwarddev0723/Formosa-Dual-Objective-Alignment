@@ -1,0 +1,10 @@
+caption:
+  enabled: false
+contrastive:
+  enabled: true
+  lambda_value: 1.0
+training:
+  num_epochs: 5
+logging:
+  run_name: v2_contrast_only
+  output_dir: outputs/v2_contrast_only

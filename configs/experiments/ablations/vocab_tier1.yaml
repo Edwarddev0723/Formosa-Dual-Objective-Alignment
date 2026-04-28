@@ -1,0 +1,6 @@
+# Tier-1 only vocab (smaller, faster)
+data:
+  vocab_path: data/vocab/vocab_tier1.json
+logging:
+  run_name: ablation_vocab_tier1
+  output_dir: outputs/ablation_vocab_tier1

@@ -1,0 +1,8 @@
+contrastive:
+  enabled: false
+  lambda_value: 0.0
+caption:
+  enabled: true
+logging:
+  run_name: v1_caption_only
+  output_dir: outputs/v1_caption_only

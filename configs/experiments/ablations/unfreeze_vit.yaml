@@ -1,0 +1,6 @@
+model:
+  freeze_vit: false
+  unfreeze_vit_last_n: 2
+logging:
+  run_name: ablation_unfreeze_vit
+  output_dir: outputs/ablation_unfreeze_vit

@@ -1,0 +1,8 @@
+contrastive:
+  enabled: true
+  lambda_value: 0.5
+caption:
+  enabled: true
+logging:
+  run_name: ablation_lambda_0.5
+  output_dir: outputs/ablation_lambda_0.5
