@@ -66,7 +66,7 @@ class DualCollator:
             Batch dict with tensors ready for :class:`~formosa_dual.models.dual_model.DualObjectiveModel`.
         """
         images = [item["image"] for item in batch]
-        captions = [item["caption"] for item in batch]
+        captions = [self._truncate_caption(item["caption"]) for item in batch]
         pos_tag_ids_list = [item["pos_tag_ids"] for item in batch]
 
         # ------------------------------------------------------------------
@@ -100,8 +100,7 @@ class DualCollator:
             text=texts,
             images=images,
             padding=True,
-            truncation=True,
-            max_length=self._max_tokens,
+            truncation=False,
             return_tensors="pt",
         )
 
@@ -164,6 +163,23 @@ class DualCollator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _truncate_caption(self, caption: str) -> str:
+        """Truncate the assistant caption without truncating multimodal image tokens."""
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        if tokenizer is None or self._max_tokens is None or self._max_tokens <= 0:
+            return caption
+        try:
+            token_ids = tokenizer(
+                caption,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=self._max_tokens,
+            )["input_ids"]
+            return tokenizer.decode(token_ids, skip_special_tokens=True)
+        except Exception as exc:
+            logger.warning("Caption truncation failed; using raw caption: %s", exc)
+            return caption
 
     def _build_labels(self, input_ids: torch.Tensor, texts: list[str]) -> torch.Tensor:
         """Build caption labels with -100 masking on non-assistant tokens.

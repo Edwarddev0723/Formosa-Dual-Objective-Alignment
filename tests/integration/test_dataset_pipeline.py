@@ -71,36 +71,22 @@ def dataset(synth_dir, vocab):
 
 def _make_mock_processor(vocab_size: int = 32, seq_len: int = 16, batch_size: int = 2):
     """Return a minimal mock that mimics the Qwen processor API."""
-    proc = MagicMock()
-    proc.apply_chat_template.return_value = "mock_text"
-    proc.tokenizer.convert_tokens_to_ids.return_value = 1
-    proc.tokenizer.pad_token_id = 0
-
-    def _call(text, images, padding, truncation, max_length, return_tensors):
-        B = len(text)
-        return {
-            "input_ids": torch.ones(B, seq_len, dtype=torch.long),
-            "attention_mask": torch.ones(B, seq_len, dtype=torch.long),
-            "pixel_values": torch.zeros(B, 3, 224, 224),
-        }
-
-    proc.side_effect = None
-    proc.__call__ = _call
-    proc.return_value = None
-
-    # Make the mock callable correctly
-    proc_callable = MagicMock(side_effect=_call)
-    proc.apply_chat_template = MagicMock(return_value="mock_text")
-    proc.tokenizer = MagicMock()
-    proc.tokenizer.convert_tokens_to_ids = MagicMock(return_value=1)
-    proc.tokenizer.pad_token_id = 0
-
-    # Wrap in a simple object so __call__ works
     class MockProcessor:
+        def __init__(self):
+            self.calls = []
+
         def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=False):
             return "mock_text"
 
-        def __call__(self, text, images, padding, truncation, max_length, return_tensors):
+        def __call__(self, text, images, padding, truncation, return_tensors):
+            self.calls.append(
+                {
+                    "text": text,
+                    "padding": padding,
+                    "truncation": truncation,
+                    "return_tensors": return_tensors,
+                }
+            )
             B = len(text)
             return {
                 "input_ids": torch.ones(B, seq_len, dtype=torch.long),
@@ -112,6 +98,17 @@ def _make_mock_processor(vocab_size: int = 32, seq_len: int = 16, batch_size: in
             @staticmethod
             def convert_tokens_to_ids(token):
                 return 1
+
+            @staticmethod
+            def __call__(text, add_special_tokens=False, truncation=True, max_length=None):
+                ids = list(range(len(text)))
+                if truncation and max_length is not None:
+                    ids = ids[:max_length]
+                return {"input_ids": ids}
+
+            @staticmethod
+            def decode(token_ids, skip_special_tokens=True):
+                return "x" * len(token_ids)
 
             pad_token_id = 0
 
@@ -144,6 +141,7 @@ def test_collator_pads_correctly(dataset, vocab):
     assert out["pos_tag_ids"].shape == (2, 5)
     assert out["pos_tag_mask"].dtype == torch.bool
     assert out["pos_tag_ids"].shape[0] == 2
+    assert processor.calls[-1]["truncation"] is False
 
 
 def test_collator_negative_sampling_works(dataset, vocab):
