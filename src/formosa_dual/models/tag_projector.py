@@ -113,7 +113,9 @@ class TagProjector(nn.Module):
                         feat = None
                 if feat is None:
                     out = clip_model.text_model(**inputs)
-                    feat = out.last_hidden_state[:, 0, :]  # CLS token
+                    feat = _pool_text_features(out)
+                else:
+                    feat = _pool_text_features(feat)
 
                 feat = F.normalize(feat.float(), p=2, dim=-1)
                 embs.append(feat.cpu())
@@ -167,3 +169,26 @@ class TagProjector(nn.Module):
     def forward(self, tag_ids: torch.Tensor) -> torch.Tensor:
         """Alias for :meth:`get_tag_embeddings`."""
         return self.get_tag_embeddings(tag_ids)
+
+
+def _pool_text_features(output) -> torch.Tensor:
+    """Extract a 2-D text embedding tensor from common Transformers outputs."""
+    if isinstance(output, torch.Tensor):
+        return output
+
+    pooler = getattr(output, "pooler_output", None)
+    if isinstance(pooler, torch.Tensor):
+        return pooler
+
+    last_hidden = getattr(output, "last_hidden_state", None)
+    if isinstance(last_hidden, torch.Tensor):
+        return last_hidden[:, 0, :]
+
+    if isinstance(output, (tuple, list)):
+        for item in output:
+            if isinstance(item, torch.Tensor):
+                if item.dim() == 3:
+                    return item[:, 0, :]
+                return item
+
+    raise TypeError(f"Cannot extract text features from output type {type(output)!r}")
