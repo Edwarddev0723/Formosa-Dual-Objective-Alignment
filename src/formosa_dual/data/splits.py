@@ -7,13 +7,8 @@ CLIP cosine similarity.
 from __future__ import annotations
 
 import collections
-import hashlib
-import json
 import random
-from pathlib import Path
-from typing import Optional
 
-from formosa_dual.data.manifest import load_manifest, write_manifest
 from formosa_dual.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -66,11 +61,11 @@ def build_splits(
     """
     rng = random.Random(seed)
 
-    # Group records by group_by field
-    groups: dict[str, list[dict]] = collections.defaultdict(list)
-    for rec in records:
-        key = rec.get(group_by) or rec.get("id", "")
-        groups[key].append(rec)
+    # Group records by the requested group key AND duplicate image identity.
+    # A dataset can contain the same image under multiple article URLs; those
+    # records must stay together or the leakage verifier will correctly fail.
+    groups = _build_leakage_groups(records, group_by=group_by)
+    logger.info("Built %d leakage-safe groups from %d records", len(groups), len(records))
 
     # Stratify groups by stratify_by field
     strata: dict[str, list[str]] = collections.defaultdict(list)
@@ -101,8 +96,10 @@ def build_splits(
     dev_records = _collect(dev_groups)
     test_id_records = _collect(test_groups)
 
-    # test_source_holdout: take from a different source if possible
-    all_sources = {rec.get(stratify_by, "") for rec in records}
+    non_train_pool = dev_records + test_id_records
+
+    # test_source_holdout: take from a non-train source if possible
+    all_sources = {rec.get(stratify_by, "") for rec in non_train_pool}
     holdout_records: list[dict] = []
     # ASSUMPTION: hold out records from the source with the fewest train groups
     source_train_counts: dict[str, int] = collections.Counter(
@@ -110,13 +107,13 @@ def build_splits(
     )
     if all_sources:
         holdout_source = min(all_sources, key=lambda s: source_train_counts.get(s, 0))
-        holdout_candidates = [r for r in records if r.get(stratify_by) == holdout_source]
+        holdout_candidates = [r for r in non_train_pool if r.get(stratify_by) == holdout_source]
         rng.shuffle(holdout_candidates)
         holdout_records = holdout_candidates[:source_holdout]
 
-    # test_cultural_hard: highest difficulty records
+    # test_cultural_hard: highest difficulty non-train records
     sorted_by_difficulty = sorted(
-        records, key=lambda r: r.get("difficulty", 0), reverse=True
+        non_train_pool, key=lambda r: r.get("difficulty", 0), reverse=True
     )
     cultural_hard_records = sorted_by_difficulty[:cultural_hard_size]
 
@@ -134,21 +131,66 @@ def build_splits(
     return splits
 
 
+def _build_leakage_groups(records: list[dict], group_by: str) -> dict[str, list[dict]]:
+    """Build connected groups joined by article key, image_hash, or exact phash."""
+    parent = list(range(len(records)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    buckets: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    for idx, rec in enumerate(records):
+        group_value = rec.get(group_by) or rec.get("id", "")
+        if group_value:
+            buckets[("group", str(group_value))].append(idx)
+
+        image_hash = rec.get("image_hash") or ""
+        if image_hash:
+            buckets[("image_hash", str(image_hash))].append(idx)
+
+        phash = rec.get("phash") or ""
+        if phash:
+            buckets[("phash", str(phash))].append(idx)
+
+    for indexes in buckets.values():
+        first = indexes[0]
+        for idx in indexes[1:]:
+            union(first, idx)
+
+    groups_by_root: dict[int, list[dict]] = collections.defaultdict(list)
+    for idx, rec in enumerate(records):
+        groups_by_root[find(idx)].append(rec)
+
+    return {f"group_{root}": recs for root, recs in groups_by_root.items()}
+
+
 def _verify_no_leakage(splits: dict[str, list[dict]]) -> None:
     """Verify no image leakage across train vs. test splits.
 
     Raises:
         ValueError: If leakage is found.
     """
-    train_hashes: set[str] = {r.get("image_hash", "") for r in splits.get("train", [])}
+    train_hashes: set[str] = {
+        r.get("image_hash", "") for r in splits.get("train", []) if r.get("image_hash")
+    }
     train_phashes: list[str] = [r.get("phash", "") for r in splits.get("train", [])]
 
     for split_name in ("dev", "test_id", "test_source_holdout", "test_cultural_hard"):
         for rec in splits.get(split_name, []):
             # Exact hash overlap
-            if rec.get("image_hash") in train_hashes:
+            rec_hash = rec.get("image_hash", "")
+            if rec_hash and rec_hash in train_hashes:
                 raise ValueError(
-                    f"Leakage: image_hash '{rec['image_hash']}' appears in both "
+                    f"Leakage: image_hash '{rec_hash}' appears in both "
                     f"train and {split_name} (record id={rec.get('id')})"
                 )
             # Perceptual hash proximity
