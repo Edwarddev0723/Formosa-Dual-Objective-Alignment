@@ -24,24 +24,58 @@ def load_backbone(cfg: ModelConfig) -> tuple:
         ``ProcessorMixin``.
     """
     import torch
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoProcessor
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     torch_dtype = dtype_map[cfg.torch_dtype]
 
     logger.info("Loading backbone: %s (dtype=%s, attn=%s)", cfg.name, cfg.torch_dtype, cfg.attn_implementation)
 
-    model = AutoModelForVision2Seq.from_pretrained(
-        cfg.name,
-        revision=cfg.revision,
-        torch_dtype=torch_dtype,
-        attn_implementation=cfg.attn_implementation,
-        trust_remote_code=True,
-    )
+    model_cls = resolve_vision_lm_model_class(cfg.name)
+    model = _from_pretrained_compat(model_cls, cfg, torch_dtype)
     processor = AutoProcessor.from_pretrained(cfg.name, trust_remote_code=True)
 
     logger.info("Backbone loaded: %s", cfg.name)
     return model, processor
+
+
+def resolve_vision_lm_model_class(model_name: str):
+    """Resolve a Transformers vision-language generation class across versions."""
+    import transformers
+
+    if "qwen2.5-vl" in model_name.lower() or "qwen2_5_vl" in model_name.lower():
+        cls = getattr(transformers, "Qwen2_5_VLForConditionalGeneration", None)
+        if cls is not None:
+            return cls
+
+    # Transformers 5 exposes the image-text auto class; Transformers 4 also has
+    # the older Vision2Seq auto class. Prefer the newer name when available.
+    for class_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        cls = getattr(transformers, class_name, None)
+        if cls is not None:
+            return cls
+
+    raise ImportError(
+        "No compatible vision-language model class found in transformers. "
+        "Expected Qwen2_5_VLForConditionalGeneration, AutoModelForImageTextToText, "
+        "or AutoModelForVision2Seq."
+    )
+
+
+def _from_pretrained_compat(model_cls, cfg: ModelConfig, torch_dtype):
+    """Call from_pretrained with dtype kwargs compatible with Transformers 4/5."""
+    base_kwargs = {
+        "revision": cfg.revision,
+        "attn_implementation": cfg.attn_implementation,
+        "trust_remote_code": True,
+    }
+    try:
+        return model_cls.from_pretrained(cfg.name, dtype=torch_dtype, **base_kwargs)
+    except TypeError as exc:
+        if "dtype" not in str(exc):
+            raise
+        logger.info("Transformers class does not accept dtype=; retrying with torch_dtype=.")
+        return model_cls.from_pretrained(cfg.name, torch_dtype=torch_dtype, **base_kwargs)
 
 
 def apply_freeze_policy(model, cfg: ModelConfig) -> None:

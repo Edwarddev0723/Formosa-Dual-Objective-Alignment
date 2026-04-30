@@ -73,8 +73,9 @@ def main() -> None:
 
     # Load model + processor lazily so --help does not require torch.
     try:
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+        from transformers import AutoProcessor
         import torch
+        from formosa_dual.models.backbone import resolve_vision_lm_model_class
     except ImportError as exc:
         logger.error("transformers/torch import failed: %s", exc)
         sys.exit(2)
@@ -82,7 +83,8 @@ def main() -> None:
     try:
         logger.info("Loading model: %s", args.model)
         processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(args.model, trust_remote_code=True)
+        model_cls = resolve_vision_lm_model_class(args.model)
+        model = model_cls.from_pretrained(args.model, trust_remote_code=True)
         model.eval()
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to load model %s: %s", args.model, exc)
