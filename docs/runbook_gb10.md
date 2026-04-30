@@ -35,9 +35,18 @@ pip install -e .
 python scripts/verify_environment.py
 ```
 
-Expected: exit 0 with `device=cuda`, `compute_capability=9.0` (Blackwell),
-`bf16_supported=True`, `bitsandbytes_available=True`,
-`flash_attn_available=True`.
+Expected: exit 0 with `device=cuda`, `compute_capability=9.0` or `12.x`
+(depending on the GB10 software stack), `bf16_supported=True`,
+`bitsandbytes_available=True`, `flash_attn_available=True`.
+
+On GB10-class Blackwell systems, `compute_capability=12.x` is normal.
+If `flash_attn_available=False`, use SDPA until the local CUDA / flash-attn
+stack supports the installed driver:
+
+```bash
+python train_dual.py --profile prod_gb10 --experiment v3_hero --smoke \
+    --override model.attn_implementation=sdpa logging.backend=none
+```
 
 ## First Production Run
 
@@ -47,12 +56,19 @@ python scripts/download_models.py \
     --models Qwen/Qwen2.5-VL-7B-Instruct OFA-Sys/chinese-clip-vit-base-patch16
 
 # 2. Build vocab + annotations + splits (run once per dataset version)
+python scripts/prepare_hf_dataset.py \
+    --dataset renhehuang/formosa-vlm-caption-v1 \
+    --split train \
+    --output-dir data/raw
+
 python scripts/build_tag_vocab.py \
     --tier1 data/sources/tier1.txt \
     --tier2 data/sources/tier2_*.txt \
     --tier3-from-captions data/raw/captions.txt \
     --target-size 800 --min-freq 5 \
     --output data/vocab/vocab_T_v1.json
+# If there are no tier-2 tag files yet, omit the "--tier2 ..." line.
+# V3 needs non-empty culture tags; for caption-only sanity checks use v1_caption_only.
 
 python scripts/annotate_tags.py \
     --input data/raw/manifest.jsonl \
