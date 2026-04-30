@@ -60,6 +60,7 @@ python scripts/prepare_hf_dataset.py \
     --dataset renhehuang/formosa-vlm-caption-v1 \
     --split train \
     --output-dir data/raw
+# This skips unreadable/truncated images and reports the skipped count.
 
 python scripts/build_tag_vocab.py \
     --tier1 data/sources/tier1.txt \

@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageFile
 
 from formosa_dual.utils.logging import get_logger
 
@@ -61,7 +61,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
+        from datasets import Image as HfImage
         from datasets import load_dataset
     except ImportError:
         logger.error("Missing dependency: datasets. Install requirements/base.txt first.")
@@ -97,33 +99,48 @@ def main() -> None:
         columns,
     )
 
+    try:
+        dataset = dataset.cast_column(image_column, HfImage(decode=False))
+        logger.info("Using decode=False for image column; images will be validated by this script.")
+    except Exception as exc:
+        logger.warning("Could not disable automatic image decoding for %s: %s", image_column, exc)
+
     records: list[dict[str, Any]] = []
-    for idx, row in enumerate(dataset):
-        sample_id = _clean_id(str(row.get(id_column) if id_column else f"sample_{idx:06d}"))
-        caption = _extract_caption(row, caption_column)
-        image = _extract_image(row.get(image_column))
+    skipped = 0
+    id_counts: dict[str, int] = {}
+    for idx in range(len(dataset)):
+        try:
+            row = dataset[idx]
+            raw_id = str(row.get(id_column) if id_column else f"sample_{idx:06d}")
+            sample_id = _dedupe_id(_clean_id(raw_id), id_counts)
+            caption = _extract_caption(row, caption_column)
+            image = _extract_image(row.get(image_column))
 
-        img_path, sha256, phash, width, height = _save_image(image, image_dir, sample_id)
-        source_value = _source_value(row, args.source_name or args.dataset)
+            img_path, sha256, phash, width, height = _save_image(image, image_dir, sample_id)
+            source_value = _source_value(row, args.source_name or args.dataset)
 
-        records.append(
-            {
-                "id": sample_id,
-                "image_path": str(img_path),
-                "caption": caption,
-                "source": source_value,
-                "article_url": _article_url(row),
-                "image_hash": f"sha256:{sha256}",
-                "phash": phash,
-                "width": width,
-                "height": height,
-                "difficulty": _difficulty(row),
-                "culture_tags": _culture_tags(row),
-                "metadata": _metadata(row, skip={image_column}),
-            }
-        )
+            records.append(
+                {
+                    "id": sample_id,
+                    "image_path": str(img_path),
+                    "caption": caption,
+                    "source": source_value,
+                    "article_url": _article_url(row),
+                    "image_hash": f"sha256:{sha256}",
+                    "phash": phash,
+                    "width": width,
+                    "height": height,
+                    "difficulty": _difficulty(row),
+                    "culture_tags": _culture_tags(row),
+                    "metadata": _metadata(row, skip={image_column}),
+                }
+            )
+        except Exception as exc:
+            skipped += 1
+            logger.warning("Skipping sample index=%d: %s", idx, exc)
+            continue
         if (idx + 1) % 100 == 0:
-            logger.info("Prepared %d samples", idx + 1)
+            logger.info("Scanned %d samples; prepared=%d skipped=%d", idx + 1, len(records), skipped)
 
     with manifest_path.open("w", encoding="utf-8") as fh:
         for record in records:
@@ -134,6 +151,8 @@ def main() -> None:
     )
 
     logger.info("Wrote %d records to %s", len(records), manifest_path)
+    if skipped:
+        logger.warning("Skipped %d samples with unreadable images or malformed records.", skipped)
     logger.info("Wrote captions to %s", captions_path)
     logger.info("Images written to %s", image_dir)
 
@@ -160,6 +179,14 @@ def _resolve_column(
 def _clean_id(value: str) -> str:
     value = value.strip() or "sample"
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160]
+
+
+def _dedupe_id(value: str, counts: dict[str, int]) -> str:
+    count = counts.get(value, 0)
+    counts[value] = count + 1
+    if count == 0:
+        return value
+    return f"{value}_{count}"
 
 
 def _extract_caption(row: dict[str, Any], caption_column: str | None) -> str:
@@ -213,10 +240,6 @@ def _extract_image(value: Any) -> Image.Image:
 def _save_image(image: Image.Image, image_dir: Path, sample_id: str) -> tuple[Path, str, str, int, int]:
     image = image.convert("RGB")
     output_path = image_dir / f"{sample_id}.jpg"
-    counter = 1
-    while output_path.exists():
-        output_path = image_dir / f"{sample_id}_{counter}.jpg"
-        counter += 1
 
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=95)
