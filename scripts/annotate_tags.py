@@ -76,8 +76,7 @@ def main() -> None:
 
     annotated = []
     for i, record in enumerate(pending):
-        tag_ids = annotator.annotate(record)
-        tag_strs = [vocab.decode(tid) for tid in tag_ids if vocab.decode(tid)]
+        tag_strs = annotator.annotate(record)
         record = dict(record)
         record["culture_tags"] = tag_strs
         annotated.append(record)
