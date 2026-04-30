@@ -63,13 +63,12 @@ python scripts/prepare_hf_dataset.py \
 # This skips unreadable/truncated images and reports the skipped count.
 
 python scripts/build_tag_vocab.py \
-    --tier1 data/sources/tier1.txt \
-    --tier2 data/sources/tier2_*.txt \
+    --tier1 configs/tag_seeds/tier1_zh_tw.txt \
     --tier3-from-captions data/raw/captions.txt \
     --target-size 800 --min-freq 5 \
     --output data/vocab/vocab_T_v1.json
-# If there are no tier-2 tag files yet, omit the "--tier2 ..." line.
-# V3 needs non-empty culture tags; for caption-only sanity checks use v1_caption_only.
+# V3 needs non-empty culture tags; expand the seed list or add --tier2 files
+# if annotation coverage is too low. For caption-only sanity checks use v1_caption_only.
 
 python scripts/annotate_tags.py \
     --input data/raw/manifest.jsonl \

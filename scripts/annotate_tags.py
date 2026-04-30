@@ -58,7 +58,7 @@ def main() -> None:
         vocab=vocab,
         use_aho_corasick=args.use_aho_corasick,
         use_metadata=args.use_metadata,
-        max_tags=args.max_tags,
+        max_tags_per_image=args.max_tags,
     )
 
     records = load_manifest(input_path)
