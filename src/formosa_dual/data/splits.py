@@ -14,6 +14,11 @@ from formosa_dual.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+_PHASH_BITS = 64
+_PHASH_HEX_LEN = _PHASH_BITS // 4
+_PHASH_CHUNK_HEX_LEN = 2  # 8-bit chunks; distance < 8 guarantees one exact chunk.
+
+
 def _hamming_distance(a: str, b: str) -> int:
     """Compute bit-level Hamming distance between two hex-string perceptual hashes."""
     try:
@@ -131,8 +136,24 @@ def build_splits(
     return splits
 
 
+def _normalise_phash(value: object) -> str | None:
+    """Return a canonical 64-bit phash hex string, or None for invalid values."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    try:
+        intval = int(text, 16)
+    except ValueError:
+        return None
+    if intval.bit_length() > _PHASH_BITS:
+        return None
+    return f"{intval:0{_PHASH_HEX_LEN}x}"
+
+
 def _build_leakage_groups(records: list[dict], group_by: str) -> dict[str, list[dict]]:
-    """Build connected groups joined by article key, image_hash, or exact phash."""
+    """Build connected groups joined by article key, image hash, or near phash."""
     parent = list(range(len(records)))
 
     def find(x: int) -> int:
@@ -148,6 +169,7 @@ def _build_leakage_groups(records: list[dict], group_by: str) -> dict[str, list[
             parent[rb] = ra
 
     buckets: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    phash_to_indexes: dict[str, list[int]] = collections.defaultdict(list)
     for idx, rec in enumerate(records):
         group_value = rec.get(group_by) or rec.get("id", "")
         if group_value:
@@ -157,20 +179,69 @@ def _build_leakage_groups(records: list[dict], group_by: str) -> dict[str, list[
         if image_hash:
             buckets[("image_hash", str(image_hash))].append(idx)
 
-        phash = rec.get("phash") or ""
+        phash = _normalise_phash(rec.get("phash"))
         if phash:
-            buckets[("phash", str(phash))].append(idx)
+            buckets[("phash", phash)].append(idx)
+            phash_to_indexes[phash].append(idx)
 
     for indexes in buckets.values():
         first = indexes[0]
         for idx in indexes[1:]:
             union(first, idx)
 
+    _union_near_phashes(phash_to_indexes, union)
+
     groups_by_root: dict[int, list[dict]] = collections.defaultdict(list)
     for idx, rec in enumerate(records):
         groups_by_root[find(idx)].append(rec)
 
     return {f"group_{root}": recs for root, recs in groups_by_root.items()}
+
+
+def _union_near_phashes(phash_to_indexes: dict[str, list[int]], union) -> None:
+    """Union phashes whose Hamming distance is below the leakage threshold."""
+    lsh_buckets = _build_phash_lsh_index(phash_to_indexes.keys())
+
+    near_edges = 0
+    for candidates in lsh_buckets.values():
+        if len(candidates) < 2:
+            continue
+        for i, left in enumerate(candidates):
+            left_rep = phash_to_indexes[left][0]
+            for right in candidates[i + 1:]:
+                if _hamming_distance(left, right) < 8:
+                    union(left_rep, phash_to_indexes[right][0])
+                    near_edges += 1
+
+    if near_edges:
+        logger.info("Merged %d near-duplicate phash candidate edges", near_edges)
+
+
+def _build_phash_lsh_index(phashes) -> dict[tuple[int, str], list[str]]:
+    """Build byte-chunk LSH buckets for 64-bit perceptual hashes."""
+    lsh_buckets: dict[tuple[int, str], list[str]] = collections.defaultdict(list)
+    for phash in phashes:
+        for chunk_idx in range(_PHASH_HEX_LEN // _PHASH_CHUNK_HEX_LEN):
+            start = chunk_idx * _PHASH_CHUNK_HEX_LEN
+            chunk = phash[start: start + _PHASH_CHUNK_HEX_LEN]
+            lsh_buckets[(chunk_idx, chunk)].append(phash)
+    return lsh_buckets
+
+
+def _find_near_phash(
+    phash: str,
+    lsh_buckets: dict[tuple[int, str], list[str]],
+) -> str | None:
+    """Return a near phash from *lsh_buckets*, or None if no near match exists."""
+    candidates: set[str] = set()
+    for chunk_idx in range(_PHASH_HEX_LEN // _PHASH_CHUNK_HEX_LEN):
+        start = chunk_idx * _PHASH_CHUNK_HEX_LEN
+        chunk = phash[start: start + _PHASH_CHUNK_HEX_LEN]
+        candidates.update(lsh_buckets.get((chunk_idx, chunk), []))
+    for candidate in candidates:
+        if _hamming_distance(phash, candidate) < 8:
+            return candidate
+    return None
 
 
 def _verify_no_leakage(splits: dict[str, list[dict]]) -> None:
@@ -182,7 +253,12 @@ def _verify_no_leakage(splits: dict[str, list[dict]]) -> None:
     train_hashes: set[str] = {
         r.get("image_hash", "") for r in splits.get("train", []) if r.get("image_hash")
     }
-    train_phashes: list[str] = [r.get("phash", "") for r in splits.get("train", [])]
+    train_phashes = {
+        phash
+        for r in splits.get("train", [])
+        if (phash := _normalise_phash(r.get("phash"))) is not None
+    }
+    train_phash_lsh = _build_phash_lsh_index(train_phashes)
 
     for split_name in ("dev", "test_id", "test_source_holdout", "test_cultural_hard"):
         for rec in splits.get(split_name, []):
@@ -194,13 +270,11 @@ def _verify_no_leakage(splits: dict[str, list[dict]]) -> None:
                     f"train and {split_name} (record id={rec.get('id')})"
                 )
             # Perceptual hash proximity
-            rec_phash = rec.get("phash", "")
-            if rec_phash:
-                for tr_phash in train_phashes:
-                    if tr_phash and _hamming_distance(rec_phash, tr_phash) < 8:
-                        raise ValueError(
-                            f"Leakage (phash Hamming<8): record {rec.get('id')} in "
-                            f"{split_name} is near-duplicate of a training image"
-                        )
+            rec_phash = _normalise_phash(rec.get("phash"))
+            if rec_phash and _find_near_phash(rec_phash, train_phash_lsh) is not None:
+                raise ValueError(
+                    f"Leakage (phash Hamming<8): record {rec.get('id')} in "
+                    f"{split_name} is near-duplicate of a training image"
+                )
 
     logger.info("Split leakage verification passed")

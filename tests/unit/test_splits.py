@@ -72,3 +72,36 @@ def test_same_phash_records_stay_together():
         for rec in split_records
     }
     assert split_by_id["sample_0"] == split_by_id["sample_1"]
+
+
+def test_near_phash_records_stay_together():
+    records = [
+        _record(0, "article_a", "hash_a"),
+        _record(1, "article_b", "hash_b"),
+        _record(2, "article_c", "hash_c"),
+        _record(3, "article_d", "hash_d"),
+        _record(4, "article_e", "hash_e"),
+        _record(5, "article_f", "hash_f"),
+    ]
+    records[0]["phash"] = "0000000000000000"
+    records[1]["phash"] = "0000000000000001"  # Hamming distance 1
+    for idx in range(2, len(records)):
+        records[idx]["phash"] = f"{idx + 1:016x}"
+
+    splits = build_splits(
+        records,
+        train_ratio=0.5,
+        dev_ratio=0.25,
+        test_ratio=0.25,
+        source_holdout=10,
+        cultural_hard_size=10,
+        seed=11,
+    )
+
+    split_by_id = {
+        rec["id"]: split_name
+        for split_name, split_records in splits.items()
+        if split_name in {"train", "dev", "test_id"}
+        for rec in split_records
+    }
+    assert split_by_id["sample_0"] == split_by_id["sample_1"]
