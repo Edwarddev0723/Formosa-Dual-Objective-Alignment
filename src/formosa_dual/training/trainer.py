@@ -9,6 +9,7 @@ Public methods:
     save_checkpoint(name: str) -> Path
     load_checkpoint(path: Path) -> None
 """
+
 from __future__ import annotations
 
 import math
@@ -18,11 +19,16 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from formosa_dual.config.schema import RunConfig
 from formosa_dual.data.tag_vocab import TagVocabulary
 from formosa_dual.losses.dual_objective import DualObjectiveLoss
-from formosa_dual.training.callbacks import CheckpointCallback, EvalCallback, LoggingCallback
+from formosa_dual.training.callbacks import (
+    CheckpointCallback,
+    EvalCallback,
+    LoggingCallback,
+)
 from formosa_dual.training.checkpoint import load_checkpoint, save_checkpoint
 from formosa_dual.utils.logging import get_logger
 from formosa_dual.utils.seeding import set_seed
@@ -76,7 +82,11 @@ class DualTrainer:
             self.val_loader,
             self.scheduler,
         ) = accelerator.prepare(
-            self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler
+            self.model,
+            self.optimizer,
+            self.train_loader,
+            self.val_loader,
+            self.scheduler,
         )
 
         # Internal state
@@ -115,70 +125,97 @@ class DualTrainer:
         cfg = self.cfg
         smoke = cfg.smoke.enabled
         max_steps = cfg.smoke.max_steps if smoke else None
+        progress_total = _training_progress_total(cfg, self.train_loader)
+        progress = tqdm(
+            total=progress_total,
+            initial=min(self._global_step, progress_total) if progress_total else 0,
+            desc="train",
+            unit="step",
+            dynamic_ncols=True,
+            disable=_progress_disabled(self.accelerator),
+        )
 
-        for epoch in range(cfg.training.num_epochs):
-            self._current_epoch = epoch
-            logger.info("Epoch %d / %d", epoch + 1, cfg.training.num_epochs)
+        try:
+            for epoch in range(cfg.training.num_epochs):
+                self._current_epoch = epoch
+                logger.info("Epoch %d / %d", epoch + 1, cfg.training.num_epochs)
 
-            for batch in self.train_loader:
-                self._global_step += 1
+                for batch in self.train_loader:
+                    self._global_step += 1
 
-                # Hard negative refresh
-                if (
-                    cfg.contrastive.enabled
-                    and cfg.contrastive.neg_sampling == "hard"
-                    and self._global_step % cfg.contrastive.hard_neg_refresh_every_steps == 0
-                ):
-                    self._refresh_hard_negatives()
+                    # Hard negative refresh
+                    if (
+                        cfg.contrastive.enabled
+                        and cfg.contrastive.neg_sampling == "hard"
+                        and self._global_step
+                        % cfg.contrastive.hard_neg_refresh_every_steps
+                        == 0
+                    ):
+                        self._refresh_hard_negatives()
 
-                # Forward + loss
-                with self.accelerator.accumulate(self.model):
-                    model_output = self.model(batch)
-                    loss_dict = self.loss_fn(model_output, batch, self._global_step)
-                    loss = loss_dict["loss"]
+                    # Forward + loss
+                    with self.accelerator.accumulate(self.model):
+                        model_output = self.model(batch)
+                        loss_dict = self.loss_fn(model_output, batch, self._global_step)
+                        loss = loss_dict["loss"]
 
-                    if not loss.isfinite():
-                        logger.error("NaN/Inf loss detected at step %d — aborting.", self._global_step)
-                        sys.exit(2)
+                        if not loss.isfinite():
+                            logger.error(
+                                "NaN/Inf loss detected at step %d — aborting.",
+                                self._global_step,
+                            )
+                            sys.exit(2)
 
-                    self.accelerator.backward(loss)
+                        self.accelerator.backward(loss)
 
-                    if cfg.optim.max_grad_norm > 0:
-                        self.accelerator.clip_grad_norm_(
-                            self.model.parameters(), cfg.optim.max_grad_norm
+                        if cfg.optim.max_grad_norm > 0:
+                            self.accelerator.clip_grad_norm_(
+                                self.model.parameters(), cfg.optim.max_grad_norm
+                            )
+
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+
+                    # Build metrics dict for callbacks
+                    metrics = {
+                        "loss": loss.item(),
+                        "loss_caption": _to_scalar(loss_dict["loss_caption"]),
+                        "loss_contrast": _to_scalar(loss_dict["loss_contrast"]),
+                        "lambda": loss_dict["lambda"],
+                        "epoch": epoch + 1,
+                    }
+                    for g in self.optimizer.param_groups:
+                        if "name" in g:
+                            metrics[f"lr_{g['name']}"] = g["lr"]
+
+                    progress.update(1)
+                    progress.set_postfix(
+                        loss=f"{metrics['loss']:.4f}",
+                        cap=f"{metrics['loss_caption']:.4f}",
+                        con=f"{metrics['loss_contrast']:.4f}",
+                        lam=f"{metrics['lambda']:.3f}",
+                    )
+
+                    # Fire callbacks
+                    for cb in self._callbacks:
+                        if hasattr(cb, "on_step_end"):
+                            cb.on_step_end(self, self._global_step, metrics)
+
+                    # Smoke cap
+                    if max_steps is not None and self._global_step >= max_steps:
+                        logger.info(
+                            "Smoke mode: max_steps=%d reached, stopping.", max_steps
                         )
+                        break
 
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
-
-                # Build metrics dict for callbacks
-                metrics = {
-                    "loss": loss.item(),
-                    "loss_caption": _to_scalar(loss_dict["loss_caption"]),
-                    "loss_contrast": _to_scalar(loss_dict["loss_contrast"]),
-                    "lambda": loss_dict["lambda"],
-                    "epoch": epoch + 1,
-                }
-                for g in self.optimizer.param_groups:
-                    if "name" in g:
-                        metrics[f"lr_{g['name']}"] = g["lr"]
-
-                # Fire callbacks
-                for cb in self._callbacks:
-                    if hasattr(cb, "on_step_end"):
-                        cb.on_step_end(self, self._global_step, metrics)
-
-                # Smoke cap
-                if max_steps is not None and self._global_step >= max_steps:
-                    logger.info("Smoke mode: max_steps=%d reached, stopping.", max_steps)
-                    break
-
-            else:
-                # Epoch exhausted without smoke break
-                continue
-            # Smoke break propagated
-            break
+                else:
+                    # Epoch exhausted without smoke break
+                    continue
+                # Smoke break propagated
+                break
+        finally:
+            progress.close()
 
         # Final eval + checkpoint
         val_metrics = self.evaluate("val")
@@ -203,13 +240,27 @@ class DualTrainer:
         total_loss_contrast = 0.0
         n_steps = 0
 
+        eval_progress = tqdm(
+            self.val_loader,
+            total=_safe_len(self.val_loader),
+            desc=f"eval:{test_set_name}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            disable=_progress_disabled(self.accelerator),
+        )
+
         with torch.no_grad():
-            for batch in self.val_loader:
+            for batch in eval_progress:
                 model_output = self.model(batch)
                 loss_dict = self.loss_fn(model_output, batch, self._global_step)
                 total_loss_caption += _to_scalar(loss_dict["loss_caption"])
                 total_loss_contrast += _to_scalar(loss_dict["loss_contrast"])
                 n_steps += 1
+                eval_progress.set_postfix(
+                    cap=f"{total_loss_caption / n_steps:.4f}",
+                    con=f"{total_loss_contrast / n_steps:.4f}",
+                )
 
         self.model.train()
         n_steps = max(n_steps, 1)
@@ -239,7 +290,9 @@ class DualTrainer:
         Returns:
             Path to checkpoint directory.
         """
-        output_dir = Path(self.cfg.logging.output_dir) / (self.cfg.logging.run_name or "run")
+        output_dir = Path(self.cfg.logging.output_dir) / (
+            self.cfg.logging.run_name or "run"
+        )
         return save_checkpoint(
             model=self.model,
             optimizer=self.optimizer,
@@ -284,7 +337,9 @@ class DualTrainer:
             try:
                 sampler.refresh_hard_neg_index(self.model, self.train_loader)
             except NotImplementedError:
-                logger.warning("NegativeSampler.refresh_hard_neg_index not implemented; skipping.")
+                logger.warning(
+                    "NegativeSampler.refresh_hard_neg_index not implemented; skipping."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +348,35 @@ class DualTrainer:
 
 
 def _compute_total_steps(cfg: RunConfig, train_loader: DataLoader) -> int:
-    steps_per_epoch = math.ceil(len(train_loader) / cfg.training.gradient_accumulation_steps)
+    steps_per_epoch = math.ceil(
+        len(train_loader) / cfg.training.gradient_accumulation_steps
+    )
     if cfg.smoke.enabled:
         return cfg.smoke.max_steps
     return steps_per_epoch * cfg.training.num_epochs
+
+
+def _training_progress_total(cfg: RunConfig, train_loader: DataLoader) -> int | None:
+    """Return total progress-bar steps for the current training loop."""
+    if cfg.smoke.enabled:
+        return cfg.smoke.max_steps
+    loader_len = _safe_len(train_loader)
+    if loader_len is None:
+        return None
+    return loader_len * cfg.training.num_epochs
+
+
+def _safe_len(obj) -> int | None:
+    """Return ``len(obj)`` when available, otherwise ``None`` for indeterminate bars."""
+    try:
+        return len(obj)
+    except TypeError:
+        return None
+
+
+def _progress_disabled(accelerator) -> bool:
+    """Disable progress bars on non-main processes under distributed launch."""
+    return not bool(getattr(accelerator, "is_local_main_process", True))
 
 
 def _build_optimizer(cfg: RunConfig, model):
@@ -308,9 +388,13 @@ def _build_optimizer(cfg: RunConfig, model):
     optimizer_name = cfg.optim.optimizer
     if optimizer_name == "adamw_8bit":
         from formosa_dual.training.device import has_bitsandbytes
+
         if not has_bitsandbytes():
-            raise RuntimeError("adamw_8bit requires bitsandbytes which is not installed.")
+            raise RuntimeError(
+                "adamw_8bit requires bitsandbytes which is not installed."
+            )
         import bitsandbytes as bnb
+
         return bnb.optim.AdamW8bit(
             param_groups,
             betas=(cfg.optim.adam_beta1, cfg.optim.adam_beta2),
@@ -326,6 +410,7 @@ def _build_optimizer(cfg: RunConfig, model):
 
 def _build_scheduler(cfg: RunConfig, optimizer, total_steps: int):
     from transformers import get_scheduler
+
     warmup_steps = int(cfg.optim.warmup_ratio * total_steps)
     return get_scheduler(
         cfg.optim.scheduler,
