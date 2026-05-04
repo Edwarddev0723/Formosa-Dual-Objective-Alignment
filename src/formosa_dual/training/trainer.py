@@ -191,9 +191,9 @@ class DualTrainer:
 
                     progress.update(1)
                     progress.set_postfix(
-                        loss=f"{metrics['loss']:.4f}",
-                        cap=f"{metrics['loss_caption']:.4f}",
-                        con=f"{metrics['loss_contrast']:.4f}",
+                        loss=_format_metric(metrics["loss"]),
+                        cap=_format_metric(metrics["loss_caption"]),
+                        con=_format_metric(metrics["loss_contrast"]),
                         lam=f"{metrics['lambda']:.3f}",
                     )
 
@@ -258,8 +258,8 @@ class DualTrainer:
                 total_loss_contrast += _to_scalar(loss_dict["loss_contrast"])
                 n_steps += 1
                 eval_progress.set_postfix(
-                    cap=f"{total_loss_caption / n_steps:.4f}",
-                    con=f"{total_loss_contrast / n_steps:.4f}",
+                    cap=_format_metric(total_loss_caption / n_steps),
+                    con=_format_metric(total_loss_contrast / n_steps),
                 )
 
         self.model.train()
@@ -274,10 +274,13 @@ class DualTrainer:
             "val_retrieval_r5": 0.0,  # ASSUMPTION: full retrieval eval not implemented here
         }
         logger.info(
-            "%s | val_loss_caption=%.4f | val_perplexity=%.2f",
+            "%s | val_loss_caption=%.4f | val_loss_contrast=%.4f | "
+            "val_perplexity=%.2f | val_retrieval_r5=%.4f",
             test_set_name,
             avg_caption,
+            avg_contrast,
             metrics["val_perplexity"],
+            metrics["val_retrieval_r5"],
         )
         return metrics
 
@@ -431,3 +434,10 @@ def _to_scalar(val) -> float:
     if isinstance(val, torch.Tensor):
         return val.item()
     return float(val)
+
+
+def _format_metric(value: float) -> str:
+    """Format progress-bar metrics without hiding tiny non-zero values."""
+    if value != 0.0 and abs(value) < 1e-4:
+        return f"{value:.2e}"
+    return f"{value:.4f}"
