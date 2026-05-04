@@ -319,6 +319,7 @@ def main() -> None:
             manifest_path=Path(manifest_path),
             vocab=vocab,
             image_root=Path(cfg.data.image_root),
+            smoke_max_samples=smoke_max_eval,
         )
         test_loader = DataLoader(
             test_ds,
