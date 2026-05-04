@@ -15,6 +15,7 @@ Exit codes:
   1 — config error or environment error
   2 — training failed mid-way
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,19 +23,88 @@ import sys
 from pathlib import Path
 
 
+def _effective_processor_pixels(cfg) -> tuple[int, int]:
+    """Return effective ``(min_pixels, max_pixels)`` for the Qwen processor."""
+    max_pixels = int(cfg.data.max_pixels)
+    if cfg.smoke.enabled and cfg.smoke.max_pixels_override is not None:
+        max_pixels = int(cfg.smoke.max_pixels_override)
+
+    min_pixels = int(getattr(cfg.data, "min_pixels", max_pixels))
+    if min_pixels > max_pixels:
+        min_pixels = max_pixels
+    return min_pixels, max_pixels
+
+
+def _set_processor_pixel_budget(processor, min_pixels: int, max_pixels: int) -> None:
+    """Set pixel budget attributes on common Qwen processor/image-processor objects."""
+    targets = [processor]
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is not None:
+        targets.append(image_processor)
+
+    for target in targets:
+        setattr(target, "min_pixels", min_pixels)
+        setattr(target, "max_pixels", max_pixels)
+
+
+def _load_processor(cfg, logger):
+    """Load AutoProcessor with the resolved image pixel budget applied."""
+    from transformers import AutoProcessor
+
+    min_pixels, max_pixels = _effective_processor_pixels(cfg)
+    logger.info(
+        "Processor pixel budget: min_pixels=%d max_pixels=%d", min_pixels, max_pixels
+    )
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            cfg.model.name,
+            trust_remote_code=True,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+    except TypeError as exc:
+        if "min_pixels" not in str(exc) and "max_pixels" not in str(exc):
+            raise
+        logger.warning(
+            "Processor class did not accept min_pixels/max_pixels in from_pretrained; "
+            "applying them after load."
+        )
+        processor = AutoProcessor.from_pretrained(
+            cfg.model.name, trust_remote_code=True
+        )
+
+    _set_processor_pixel_budget(processor, min_pixels, max_pixels)
+    return processor
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Train the formosa-dual model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--profile", required=True, choices=["dev_mac", "dev_smoke", "prod_gb10"])
-    parser.add_argument("--experiment", required=True, help="Experiment config name (e.g. v3_hero).")
-    parser.add_argument("--override", nargs="*", default=[], metavar="KEY=VALUE",
-                        help="Override config keys (e.g. training.num_epochs=5).")
+    parser.add_argument(
+        "--profile", required=True, choices=["dev_mac", "dev_smoke", "prod_gb10"]
+    )
+    parser.add_argument(
+        "--experiment", required=True, help="Experiment config name (e.g. v3_hero)."
+    )
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override config keys (e.g. training.num_epochs=5).",
+    )
     parser.add_argument("--smoke", action="store_true", help="Force smoke mode.")
-    parser.add_argument("--resume-from", default=None, help="Path to a checkpoint directory.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Load + print resolved config then exit without training.")
+    parser.add_argument(
+        "--resume-from", default=None, help="Path to a checkpoint directory."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Load + print resolved config then exit without training.",
+    )
     return parser.parse_args()
 
 
@@ -61,10 +131,12 @@ def main() -> None:
         sys.exit(1)
 
     from formosa_dual.utils.logging import get_logger
+
     logger = get_logger(__name__)
 
     # --- Step 3: Device capability report ---
     from formosa_dual.training.device import device_capability_report
+
     report = device_capability_report()
     for k, v in report.items():
         logger.info("env | %s = %s", k, v)
@@ -72,6 +144,7 @@ def main() -> None:
     # --- Step 4: Validate config for device ---
     from formosa_dual.config.validation import validate_config_for_device
     from formosa_dual.training.device import select_device
+
     device = select_device(cfg.device)
     try:
         validate_config_for_device(cfg, device)
@@ -81,11 +154,13 @@ def main() -> None:
 
     # --- Step 5: Set seed ---
     from formosa_dual.utils.seeding import set_seed
+
     set_seed(cfg.training.seed)
 
     # --- Step 6: Dry run ---
     if args.dry_run:
         import yaml
+
         # Hard-stop guard: refuse to actually train when both losses are disabled
         # (we got here only via allow_no_loss=True).
         if not cfg.caption.enabled and not cfg.contrastive.enabled:
@@ -106,6 +181,7 @@ def main() -> None:
 
     # --- Step 7: Build accelerator ---
     from formosa_dual.training.accelerator import build_accelerator
+
     accelerator = build_accelerator(cfg)
     # accelerator.device should match `device` selected above; trust accelerator's value.
     device = accelerator.device
@@ -151,8 +227,7 @@ def main() -> None:
 
     # Processor is loaded both here (for the collator) and inside
     # DualObjectiveModel.load_backbone(); transformers caches so this is cheap.
-    from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(cfg.model.name, trust_remote_code=True)
+    processor = _load_processor(cfg, logger)
 
     # ASSUMPTION: not specified in spec §4.1; using DualCollator default of 10
     # (spec §5.9). Extend AuxModulesConfig if a per-experiment override becomes needed.
@@ -183,13 +258,18 @@ def main() -> None:
 
     # --- Step 9: Build model ---
     from formosa_dual.models.dual_model import DualObjectiveModel
+
     model = DualObjectiveModel(cfg=cfg, vocab=vocab, processor=processor)
     model.to(device)
 
     # --- Step 10: Build loss ---
     from formosa_dual.losses.dual_objective import DualObjectiveLoss
     import math
-    total_steps = math.ceil(len(train_loader) / cfg.training.gradient_accumulation_steps) * cfg.training.num_epochs
+
+    total_steps = (
+        math.ceil(len(train_loader) / cfg.training.gradient_accumulation_steps)
+        * cfg.training.num_epochs
+    )
     if cfg.smoke.enabled:
         total_steps = cfg.smoke.max_steps
     loss_fn = DualObjectiveLoss(cfg=cfg, total_steps=total_steps)
@@ -199,6 +279,7 @@ def main() -> None:
 
     # --- Step 14: Build trainer and train ---
     from formosa_dual.training.trainer import DualTrainer
+
     trainer = DualTrainer(
         cfg=cfg,
         model=model,
@@ -251,6 +332,7 @@ def main() -> None:
 
     # --- Step 16: Write report ---
     from formosa_dual.eval.reporter import Reporter
+
     output_dir = Path(cfg.logging.output_dir) / (cfg.logging.run_name or "run")
     reporter = Reporter(output_dir=output_dir, run_name=cfg.logging.run_name or "run")
     reporter.add_section("final_val", trainer._last_val_metrics)

@@ -17,6 +17,7 @@ Forward contract:
 If ``cfg.contrastive.enabled`` is False, all visual/tag fields are None
 and the pooler / proj_head / tag_projector are NOT instantiated.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -75,6 +76,9 @@ class DualObjectiveModel(nn.Module):
             backbone.print_trainable_parameters()
             logger.info("LoRA applied to backbone")
 
+        if getattr(getattr(cfg, "training", None), "gradient_checkpointing", False):
+            self._enable_gradient_checkpointing(backbone)
+
         self.backbone = backbone
 
         # Resolve LM hidden size from the backbone config (no schema field needed).
@@ -104,6 +108,7 @@ class DualObjectiveModel(nn.Module):
             )
 
             from formosa_dual.models.tag_projector import TagProjector
+
             # TagProjector will encode all tags; device determined later when .to(device) is called
             self.tag_projector = TagProjector(
                 vocab=vocab,
@@ -137,6 +142,31 @@ class DualObjectiveModel(nn.Module):
         if hasattr(cfg, "hidden_size"):
             return int(cfg.hidden_size)
         raise RuntimeError("Cannot resolve hidden_size from backbone.config")
+
+    @staticmethod
+    def _enable_gradient_checkpointing(backbone) -> None:
+        """Enable HF gradient checkpointing and disable KV cache when available."""
+        for config_obj in (
+            getattr(backbone, "config", None),
+            getattr(getattr(backbone, "base_model", None), "config", None),
+        ):
+            if config_obj is not None and hasattr(config_obj, "use_cache"):
+                config_obj.use_cache = False
+
+        if hasattr(backbone, "gradient_checkpointing_enable"):
+            try:
+                backbone.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                backbone.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled on backbone")
+        else:
+            logger.warning("Backbone does not expose gradient_checkpointing_enable()")
+
+        if hasattr(backbone, "enable_input_require_grads"):
+            backbone.enable_input_require_grads()
+            logger.info("Input gradients enabled for checkpointed LoRA training")
 
     # ------------------------------------------------------------------
     # Forward hook registration
@@ -180,7 +210,9 @@ class DualObjectiveModel(nn.Module):
     def _merger_hook(self, module, input, output):  # noqa: ARG002
         """Forward hook: cache merger output tensor."""
         # output shape: [B, N_v, d_lm] or similar
-        self._cached_visual_tokens = output if isinstance(output, torch.Tensor) else output[0]
+        self._cached_visual_tokens = (
+            output if isinstance(output, torch.Tensor) else output[0]
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -218,7 +250,7 @@ class DualObjectiveModel(nn.Module):
         backbone_out = self.backbone(**backbone_kwargs)
 
         lm_logits = backbone_out.logits  # [B, L, V]
-        lm_loss = backbone_out.loss      # scalar
+        lm_loss = backbone_out.loss  # scalar
 
         # ----------------------------------------------------------------
         # Contrastive branch
@@ -246,16 +278,23 @@ class DualObjectiveModel(nn.Module):
                         )
                     # Tokens per image after spatial merge (merge_size**2 patches → 1 token).
                     merge = getattr(
-                        getattr(self.backbone.config, "vision_config", self.backbone.config),
+                        getattr(
+                            self.backbone.config, "vision_config", self.backbone.config
+                        ),
                         "spatial_merge_size",
                         2,
                     )
-                    per_img = (thw[:, 0] * thw[:, 1] * thw[:, 2] // (merge * merge)).tolist()
+                    per_img = (
+                        thw[:, 0] * thw[:, 1] * thw[:, 2] // (merge * merge)
+                    ).tolist()
                     chunks = list(torch.split(visual_tokens, per_img, dim=0))
                     max_n = max(c.size(0) for c in chunks)
                     padded = torch.zeros(
-                        B, max_n, visual_tokens.size(-1),
-                        dtype=visual_tokens.dtype, device=visual_tokens.device,
+                        B,
+                        max_n,
+                        visual_tokens.size(-1),
+                        dtype=visual_tokens.dtype,
+                        device=visual_tokens.device,
                     )
                     for i, c in enumerate(chunks):
                         padded[i, : c.size(0)] = c
@@ -264,11 +303,11 @@ class DualObjectiveModel(nn.Module):
             # Pool visual tokens → [B, d_lm]
             # ASSUMPTION: no mask available here; treat all tokens as valid
             pooled = self.pooler(visual_tokens)  # [B, d_lm]
-            visual_emb = self.proj_head(pooled)               # [B, proj_dim]
+            visual_emb = self.proj_head(pooled)  # [B, proj_dim]
 
             # Tag embeddings
-            pos_ids = batch["pos_tag_ids"]    # [B, P_max]
-            neg_ids = batch["neg_tag_ids"]    # [B, M]
+            pos_ids = batch["pos_tag_ids"]  # [B, P_max]
+            neg_ids = batch["neg_tag_ids"]  # [B, M]
             pos_tag_mask = batch["pos_tag_mask"]  # [B, P_max] bool
 
             tag_pos_emb = self.tag_projector(pos_ids)  # [B, P_max, proj_dim]
@@ -301,14 +340,20 @@ class DualObjectiveModel(nn.Module):
         groups: list[dict] = []
 
         # LoRA params
-        lora_params = [p for n, p in self.backbone.named_parameters() if p.requires_grad and "lora" in n.lower()]
+        lora_params = [
+            p
+            for n, p in self.backbone.named_parameters()
+            if p.requires_grad and "lora" in n.lower()
+        ]
         if lora_params:
-            groups.append({
-                "params": lora_params,
-                "lr": opt.lr_lora,
-                "weight_decay": opt.weight_decay_lora,
-                "name": "lora",
-            })
+            groups.append(
+                {
+                    "params": lora_params,
+                    "lr": opt.lr_lora,
+                    "weight_decay": opt.weight_decay_lora,
+                    "name": "lora",
+                }
+            )
 
         # Aux params (pooler + proj_head)
         aux_params: list[torch.nn.Parameter] = []
@@ -317,22 +362,28 @@ class DualObjectiveModel(nn.Module):
         if self.proj_head is not None:
             aux_params.extend(p for p in self.proj_head.parameters() if p.requires_grad)
         if aux_params:
-            groups.append({
-                "params": aux_params,
-                "lr": opt.lr_aux,
-                "weight_decay": opt.weight_decay_aux,
-                "name": "aux",
-            })
+            groups.append(
+                {
+                    "params": aux_params,
+                    "lr": opt.lr_aux,
+                    "weight_decay": opt.weight_decay_aux,
+                    "name": "aux",
+                }
+            )
 
         # Tag projector (projector head only, not the frozen buffer)
         if self.tag_projector is not None:
-            tag_params = [p for p in self.tag_projector.projector.parameters() if p.requires_grad]
+            tag_params = [
+                p for p in self.tag_projector.projector.parameters() if p.requires_grad
+            ]
             if tag_params:
-                groups.append({
-                    "params": tag_params,
-                    "lr": opt.lr_aux,
-                    "weight_decay": opt.weight_decay_tag_proj,
-                    "name": "tag_proj",
-                })
+                groups.append(
+                    {
+                        "params": tag_params,
+                        "lr": opt.lr_aux,
+                        "weight_decay": opt.weight_decay_tag_proj,
+                        "name": "tag_proj",
+                    }
+                )
 
         return groups
