@@ -23,6 +23,10 @@ from tqdm.auto import tqdm
 
 from formosa_dual.config.schema import RunConfig
 from formosa_dual.data.tag_vocab import TagVocabulary
+from formosa_dual.eval.retrieval_metrics import (
+    compute_retrieval_metrics,
+    embed_all_tag_embeddings,
+)
 from formosa_dual.losses.dual_objective import DualObjectiveLoss
 from formosa_dual.training.callbacks import (
     CheckpointCallback,
@@ -239,6 +243,9 @@ class DualTrainer:
         total_loss_caption = 0.0
         total_loss_contrast = 0.0
         n_steps = 0
+        visual_batches: list[torch.Tensor] = []
+        pos_id_batches: list[torch.Tensor] = []
+        pos_mask_batches: list[torch.Tensor] = []
 
         eval_progress = tqdm(
             self.val_loader,
@@ -256,23 +263,44 @@ class DualTrainer:
                 loss_dict = self.loss_fn(model_output, batch, self._global_step)
                 total_loss_caption += _to_scalar(loss_dict["loss_caption"])
                 total_loss_contrast += _to_scalar(loss_dict["loss_contrast"])
+                visual_emb = model_output.get("visual_emb")
+                if visual_emb is not None:
+                    visual_batches.append(
+                        _gather_for_metrics(self.accelerator, visual_emb.detach()).cpu()
+                    )
+                    pos_id_batches.append(
+                        _gather_for_metrics(
+                            self.accelerator, batch["pos_tag_ids"].detach()
+                        ).cpu()
+                    )
+                    pos_mask_batches.append(
+                        _gather_for_metrics(
+                            self.accelerator, batch["pos_tag_mask"].detach()
+                        ).cpu()
+                    )
                 n_steps += 1
                 eval_progress.set_postfix(
                     cap=_format_metric(total_loss_caption / n_steps),
                     con=_format_metric(total_loss_contrast / n_steps),
                 )
 
-        self.model.train()
         n_steps = max(n_steps, 1)
         avg_caption = total_loss_caption / n_steps
         avg_contrast = total_loss_contrast / n_steps
+        retrieval_metrics = self._compute_retrieval_metrics(
+            visual_batches=visual_batches,
+            pos_id_batches=pos_id_batches,
+            pos_mask_batches=pos_mask_batches,
+        )
+        self.model.train()
 
         metrics = {
             "val_loss_caption": avg_caption,
             "val_loss_contrast": avg_contrast,
             "val_perplexity": math.exp(min(avg_caption, 20)),
-            "val_retrieval_r5": 0.0,  # ASSUMPTION: full retrieval eval not implemented here
+            "val_retrieval_r5": retrieval_metrics.get("image_to_tag_R@5", 0.0),
         }
+        metrics.update(retrieval_metrics)
         logger.info(
             "%s | val_loss_caption=%.4f | val_loss_contrast=%.4f | "
             "val_perplexity=%.2f | val_retrieval_r5=%.4f",
@@ -343,6 +371,36 @@ class DualTrainer:
                 logger.warning(
                     "NegativeSampler.refresh_hard_neg_index not implemented; skipping."
                 )
+
+    def _compute_retrieval_metrics(
+        self,
+        visual_batches: list[torch.Tensor],
+        pos_id_batches: list[torch.Tensor],
+        pos_mask_batches: list[torch.Tensor],
+    ) -> dict[str, float]:
+        """Compute image↔tag retrieval metrics from accumulated eval embeddings."""
+        if not self.cfg.contrastive.enabled or not visual_batches:
+            return {}
+
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        tag_gallery = embed_all_tag_embeddings(
+            unwrapped,
+            self.vocab,
+            device=self.accelerator.device,
+        )
+        if tag_gallery is None:
+            return {}
+
+        try:
+            return compute_retrieval_metrics(
+                visual_embs=torch.cat(visual_batches, dim=0),
+                tag_embs=tag_gallery,
+                pos_tag_ids=torch.cat(pos_id_batches, dim=0),
+                pos_tag_mask=torch.cat(pos_mask_batches, dim=0),
+            )
+        except ValueError as exc:
+            logger.warning("Retrieval metric computation skipped: %s", exc)
+            return {}
 
 
 # ---------------------------------------------------------------------------
@@ -441,3 +499,12 @@ def _format_metric(value: float) -> str:
     if value != 0.0 and abs(value) < 1e-4:
         return f"{value:.2e}"
     return f"{value:.4f}"
+
+
+def _gather_for_metrics(accelerator, tensor: torch.Tensor) -> torch.Tensor:
+    """Gather a tensor for metrics under Accelerate, no-op in single process."""
+    if hasattr(accelerator, "gather_for_metrics"):
+        return accelerator.gather_for_metrics(tensor)
+    if hasattr(accelerator, "gather"):
+        return accelerator.gather(tensor)
+    return tensor

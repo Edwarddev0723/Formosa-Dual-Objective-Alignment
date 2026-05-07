@@ -12,6 +12,7 @@ Checkpoint layout (§5.20):
     ├── training_state.json
     └── run_config.yaml
 """
+
 from __future__ import annotations
 
 import json
@@ -68,11 +69,14 @@ def save_checkpoint(
     if model.proj_head is not None:
         aux_state["proj_head"] = model.proj_head.state_dict()
     if model.tag_projector is not None:
-        aux_state["tag_projector_projector"] = model.tag_projector.projector.state_dict()
+        aux_state["tag_projector_projector"] = (
+            model.tag_projector.projector.state_dict()
+        )
 
     if aux_state:
         try:
             from safetensors.torch import save_file as st_save
+
             # safetensors requires flat {str: Tensor} — prefix keys with submodule
             flat: dict[str, torch.Tensor] = {}
             for prefix, sd in aux_state.items():
@@ -154,6 +158,7 @@ def load_checkpoint(
     aux_pt = checkpoint_dir / "aux_modules.pt"
     if aux_safetensors.exists():
         from safetensors.torch import load_file as st_load
+
         flat = st_load(str(aux_safetensors))
         _load_aux_modules(model, flat, is_flat=True)
     elif aux_pt.exists():
@@ -162,7 +167,7 @@ def load_checkpoint(
 
     # Optimizer + scheduler
     opt_path = checkpoint_dir / "optimizer.pt"
-    if opt_path.exists():
+    if optimizer is not None and opt_path.exists():
         optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
     sched_path = checkpoint_dir / "scheduler.pt"
     if scheduler is not None and sched_path.exists():
@@ -183,7 +188,11 @@ def load_checkpoint(
     else:
         training_state = {"step": 0, "epoch": 0, "best_metric": None}
 
-    logger.info("Checkpoint loaded from %s (step=%s)", checkpoint_dir, training_state.get("step"))
+    logger.info(
+        "Checkpoint loaded from %s (step=%s)",
+        checkpoint_dir,
+        training_state.get("step"),
+    )
     return training_state
 
 
@@ -196,11 +205,11 @@ def _load_aux_modules(model, state, is_flat: bool) -> None:
         tag_sd: dict = {}
         for k, v in state.items():
             if k.startswith("pooler."):
-                pooler_sd[k[len("pooler."):]] = v
+                pooler_sd[k[len("pooler.") :]] = v
             elif k.startswith("proj_head."):
-                proj_sd[k[len("proj_head."):]] = v
+                proj_sd[k[len("proj_head.") :]] = v
             elif k.startswith("tag_projector_projector."):
-                tag_sd[k[len("tag_projector_projector."):]] = v
+                tag_sd[k[len("tag_projector_projector.") :]] = v
     else:
         pooler_sd = state.get("pooler", {})
         proj_sd = state.get("proj_head", {})

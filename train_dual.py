@@ -309,6 +309,7 @@ def main() -> None:
         test_manifests: dict = {}
     else:
         test_manifests = getattr(cfg.data, "test_manifests", {}) or {}
+    final_test_metrics: dict[str, dict] = {}
     for test_name, manifest_path in test_manifests.items():
         if not Path(manifest_path).exists():
             logger.warning(
@@ -329,6 +330,7 @@ def main() -> None:
         )
         trainer.val_loader = accelerator.prepare(test_loader)
         metrics = trainer.evaluate(test_name)
+        final_test_metrics[test_name] = metrics
         logger.info("Test set %s: %s", test_name, metrics)
 
     # --- Step 16: Write report ---
@@ -337,6 +339,8 @@ def main() -> None:
     output_dir = Path(cfg.logging.output_dir) / (cfg.logging.run_name or "run")
     reporter = Reporter(output_dir=output_dir, run_name=cfg.logging.run_name or "run")
     reporter.add_section("final_val", trainer._last_val_metrics)
+    for test_name, metrics in final_test_metrics.items():
+        reporter.add_section(test_name, metrics)
     reporter.write()
     logger.info("Training complete. Reports in %s", output_dir)
     sys.exit(0)
