@@ -36,9 +36,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--test-set",
         required=True,
-        help="Configured test-set name or manifest JSONL path.",
+        help="Configured test-set name, comma-separated names, 'all', or manifest JSONL path.",
     )
     p.add_argument("--output", required=True, help="Output JSON path.")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override eval batch size. Defaults to training.per_device_batch_size.",
+    )
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override DataLoader workers. Defaults to data.num_workers.",
+    )
     return p.parse_args()
 
 
@@ -72,7 +84,10 @@ def main() -> None:
         from formosa_dual.data.dataset import FormosaDataset
         from formosa_dual.data.negative_sampler import NegativeSampler
         from formosa_dual.data.tag_vocab import TagVocabulary
-        from formosa_dual.eval.retrieval_metrics import evaluate_retrieval_loader
+        from formosa_dual.eval.retrieval_metrics import (
+            embed_all_tag_embeddings,
+            evaluate_retrieval_loader,
+        )
         from formosa_dual.models.dual_model import DualObjectiveModel
         from formosa_dual.training.checkpoint import load_checkpoint
     except ImportError as exc:
@@ -82,10 +97,11 @@ def main() -> None:
     try:
         cfg = _load_checkpoint_config(ckpt_dir, args.base_model, yaml, RunConfig)
         vocab = TagVocabulary(Path(cfg.data.vocab_path))
-        manifest_path = _resolve_test_manifest(args.test_set, cfg)
-        if not manifest_path.exists():
-            logger.error("Test manifest not found: %s", manifest_path.resolve())
-            sys.exit(1)
+        test_specs = _resolve_test_manifests(args.test_set, cfg)
+        for _, manifest_path in test_specs:
+            if not manifest_path.exists():
+                logger.error("Test manifest not found: %s", manifest_path.resolve())
+                sys.exit(1)
 
         device = _select_eval_device(torch, cfg)
         logger.info("Retrieval eval device: %s", device)
@@ -106,20 +122,6 @@ def main() -> None:
             max_caption_tokens=cfg.caption.max_caption_tokens,
             max_pos_tags=10,
         )
-        dataset = FormosaDataset(
-            manifest_path=manifest_path,
-            vocab=vocab,
-            image_root=Path(cfg.data.image_root),
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=cfg.training.per_device_batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=cfg.data.num_workers,
-            pin_memory=cfg.data.pin_memory,
-        )
-
         model = DualObjectiveModel(cfg=cfg, vocab=vocab, processor=processor)
         model.to(device)
         load_checkpoint(
@@ -131,28 +133,56 @@ def main() -> None:
         )
         model.eval()
 
-        metrics = evaluate_retrieval_loader(
-            model=model,
-            dataloader=dataloader,
-            vocab=vocab,
-            device=device,
-            desc=f"retrieval:{manifest_path.stem}",
-            show_progress=True,
-        )
+        tag_gallery = embed_all_tag_embeddings(model, vocab, device=device)
+        if tag_gallery is None:
+            raise RuntimeError("Checkpoint does not expose tag_projector embeddings")
+
+        split_reports = {}
+        for test_name, manifest_path in test_specs:
+            dataset = FormosaDataset(
+                manifest_path=manifest_path,
+                vocab=vocab,
+                image_root=Path(cfg.data.image_root),
+            )
+            dataloader = _build_dataloader(
+                DataLoader,
+                dataset,
+                collator,
+                cfg,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+            metrics = evaluate_retrieval_loader(
+                model=model,
+                dataloader=dataloader,
+                vocab=vocab,
+                device=device,
+                desc=f"retrieval:{test_name}",
+                show_progress=True,
+                tag_gallery=tag_gallery,
+            )
+            split_reports[test_name] = {
+                "manifest": str(manifest_path),
+                "n_records": len(dataset),
+                "metrics": metrics,
+            }
+            logger.info("Loaded %d records from %s", len(dataset), manifest_path)
     except Exception as exc:  # noqa: BLE001
         logger.error("Retrieval evaluation failed: %s", exc, exc_info=True)
         sys.exit(2)
 
-    logger.info("Loaded %d records from %s", len(dataset), manifest_path)
     logger.info("Checkpoint dir: %s", ckpt_dir)
     logger.info("Base model: %s", args.base_model)
 
     report = {
         "checkpoint": str(ckpt_dir),
         "base_model": args.base_model,
-        "test_set": str(manifest_path),
-        "metrics": metrics,
+        "test_set": args.test_set,
+        "splits": split_reports,
     }
+    if len(split_reports) == 1:
+        only = next(iter(split_reports.values()))
+        report["metrics"] = only["metrics"]
     output_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -169,6 +199,28 @@ def _load_checkpoint_config(ckpt_dir: Path, base_model: str, yaml, run_config_cl
     return run_config_cls.model_validate(raw)
 
 
+def _resolve_test_manifests(test_set: str, cfg) -> list[tuple[str, Path]]:
+    manifest_map = getattr(cfg.data, "test_manifests", {}) or {}
+    if test_set == "all":
+        if not manifest_map:
+            raise ValueError(
+                "--test-set all requested, but config has no test_manifests"
+            )
+        return [(name, Path(path)) for name, path in manifest_map.items()]
+
+    specs: list[tuple[str, Path]] = []
+    for raw_name in test_set.split(","):
+        name = raw_name.strip()
+        if not name:
+            continue
+        manifest_path = _resolve_test_manifest(name, cfg)
+        report_name = name if name in manifest_map else manifest_path.stem
+        specs.append((report_name, manifest_path))
+    if not specs:
+        raise ValueError("--test-set resolved to no manifests")
+    return specs
+
+
 def _resolve_test_manifest(test_set: str, cfg) -> Path:
     candidate = Path(test_set)
     if candidate.exists():
@@ -177,6 +229,31 @@ def _resolve_test_manifest(test_set: str, cfg) -> Path:
     if test_set in manifest_map:
         return Path(manifest_map[test_set])
     return candidate
+
+
+def _build_dataloader(
+    data_loader_cls,
+    dataset,
+    collator,
+    cfg,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+):
+    effective_batch_size = batch_size or cfg.training.per_device_batch_size
+    effective_num_workers = (
+        cfg.data.num_workers if num_workers is None else max(int(num_workers), 0)
+    )
+    kwargs = {
+        "batch_size": effective_batch_size,
+        "shuffle": False,
+        "collate_fn": collator,
+        "num_workers": effective_num_workers,
+        "pin_memory": cfg.data.pin_memory,
+    }
+    if effective_num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return data_loader_cls(dataset, **kwargs)
 
 
 def _select_eval_device(torch_module, cfg):

@@ -214,6 +214,131 @@ class DualObjectiveModel(nn.Module):
             output if isinstance(output, torch.Tensor) else output[0]
         )
 
+    def encode_visual_embeddings(self, batch: dict) -> torch.Tensor | None:
+        """Encode only the visual branch for retrieval-style evaluation.
+
+        This bypasses the LM logits/loss computation used by ``forward`` and
+        therefore is much faster for retrieval metrics. If the backbone wrapper
+        does not expose a callable visual module, it falls back to ``forward``.
+        """
+        if not self.cfg.contrastive.enabled:
+            return None
+
+        visual_tokens = self._extract_visual_tokens_direct(batch)
+        if visual_tokens is None:
+            return self.forward(batch).get("visual_emb")
+        return self._visual_tokens_to_embedding(batch, visual_tokens)
+
+    def _extract_visual_tokens_direct(self, batch: dict) -> torch.Tensor | None:
+        """Call the Qwen visual tower directly when its module is reachable."""
+        visual = self._get_visual_module()
+        pixel_values = batch.get("pixel_values")
+        if visual is None or pixel_values is None or not callable(visual):
+            return None
+
+        pixel_values = self._cast_pixel_values_for_visual(pixel_values, visual)
+        image_grid_thw = batch.get("image_grid_thw")
+        try:
+            if image_grid_thw is not None:
+                return visual(pixel_values, grid_thw=image_grid_thw)
+            return visual(pixel_values)
+        except TypeError:
+            if image_grid_thw is None:
+                return None
+        try:
+            return visual(pixel_values, image_grid_thw=image_grid_thw)
+        except TypeError:
+            return None
+
+    def _get_visual_module(self):
+        """Return the callable visual encoder module under common PEFT/Qwen paths."""
+        candidates = [
+            "model.visual",
+            "visual",
+            "base_model.model.model.visual",
+            "base_model.model.visual",
+        ]
+        for path in candidates:
+            obj = self.backbone
+            for part in path.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
+    @staticmethod
+    def _cast_pixel_values_for_visual(
+        pixel_values: torch.Tensor, visual
+    ) -> torch.Tensor:
+        """Match pixel dtype to the visual module dtype when possible."""
+        if not torch.is_floating_point(pixel_values):
+            return pixel_values
+        target_dtype = getattr(visual, "dtype", None)
+        if target_dtype is None and hasattr(visual, "parameters"):
+            first_param = next(visual.parameters(), None)
+            target_dtype = first_param.dtype if first_param is not None else None
+        if target_dtype is not None and pixel_values.dtype != target_dtype:
+            return pixel_values.to(dtype=target_dtype)
+        return pixel_values
+
+    def _visual_tokens_to_embedding(
+        self,
+        batch: dict,
+        visual_tokens: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> torch.Tensor | None:
+        """Reshape visual tokens per image, then pool and project them."""
+        if self.pooler is None or self.proj_head is None:
+            return None
+
+        if not isinstance(visual_tokens, torch.Tensor):
+            visual_tokens = visual_tokens[0]
+
+        B = (
+            batch["input_ids"].size(0)
+            if "input_ids" in batch
+            else batch["pos_tag_ids"].size(0)
+        )
+        if visual_tokens.dim() == 2:
+            if B == 1:
+                visual_tokens = visual_tokens.unsqueeze(0)
+            else:
+                thw = batch.get("image_grid_thw")
+                if thw is None:
+                    raise RuntimeError(
+                        "image_grid_thw missing but B>1 with 2-D visual tokens; "
+                        "cannot reshape per-image."
+                    )
+                merge = getattr(
+                    getattr(
+                        self.backbone.config, "vision_config", self.backbone.config
+                    ),
+                    "spatial_merge_size",
+                    2,
+                )
+                per_img = (
+                    thw[:, 0] * thw[:, 1] * thw[:, 2] // (merge * merge)
+                ).tolist()
+                chunks = list(torch.split(visual_tokens, per_img, dim=0))
+                max_n = max(c.size(0) for c in chunks)
+                padded = torch.zeros(
+                    B,
+                    max_n,
+                    visual_tokens.size(-1),
+                    dtype=visual_tokens.dtype,
+                    device=visual_tokens.device,
+                )
+                for i, c in enumerate(chunks):
+                    padded[i, : c.size(0)] = c
+                visual_tokens = padded
+
+        pooler_dtype = next(self.pooler.parameters()).dtype
+        if visual_tokens.dtype != pooler_dtype:
+            visual_tokens = visual_tokens.to(dtype=pooler_dtype)
+        pooled = self.pooler(visual_tokens)
+        return self.proj_head(pooled)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -264,49 +389,9 @@ class DualObjectiveModel(nn.Module):
             # Qwen2.5-VL's `visual.merger` returns a 2-D tensor of shape
             # ``[total_visual_tokens, d_lm]`` — flattened over the batch.
             # Reshape to ``[B, N_v, d_lm]`` (padded) before pooling.
-            visual_tokens = self._cached_visual_tokens
-            B = batch["input_ids"].size(0)
-            if visual_tokens.dim() == 2:
-                if B == 1:
-                    visual_tokens = visual_tokens.unsqueeze(0)
-                else:
-                    thw = batch.get("image_grid_thw")
-                    if thw is None:
-                        raise RuntimeError(
-                            "image_grid_thw missing but B>1 with 2-D visual tokens; "
-                            "cannot reshape per-image."
-                        )
-                    # Tokens per image after spatial merge (merge_size**2 patches → 1 token).
-                    merge = getattr(
-                        getattr(
-                            self.backbone.config, "vision_config", self.backbone.config
-                        ),
-                        "spatial_merge_size",
-                        2,
-                    )
-                    per_img = (
-                        thw[:, 0] * thw[:, 1] * thw[:, 2] // (merge * merge)
-                    ).tolist()
-                    chunks = list(torch.split(visual_tokens, per_img, dim=0))
-                    max_n = max(c.size(0) for c in chunks)
-                    padded = torch.zeros(
-                        B,
-                        max_n,
-                        visual_tokens.size(-1),
-                        dtype=visual_tokens.dtype,
-                        device=visual_tokens.device,
-                    )
-                    for i, c in enumerate(chunks):
-                        padded[i, : c.size(0)] = c
-                    visual_tokens = padded
-
-            # Pool visual tokens → [B, d_lm]
-            # ASSUMPTION: no mask available here; treat all tokens as valid
-            pooler_dtype = next(self.pooler.parameters()).dtype
-            if visual_tokens.dtype != pooler_dtype:
-                visual_tokens = visual_tokens.to(dtype=pooler_dtype)
-            pooled = self.pooler(visual_tokens)  # [B, d_lm]
-            visual_emb = self.proj_head(pooled)  # [B, proj_dim]
+            visual_emb = self._visual_tokens_to_embedding(
+                batch, self._cached_visual_tokens
+            )
 
             # Tag embeddings
             pos_ids = batch["pos_tag_ids"]  # [B, P_max]

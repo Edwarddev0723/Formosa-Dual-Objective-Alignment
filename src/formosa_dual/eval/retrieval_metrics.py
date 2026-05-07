@@ -156,6 +156,7 @@ def evaluate_retrieval_loader(
     device: torch.device,
     desc: str = "retrieval",
     show_progress: bool = True,
+    tag_gallery: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Run a retrieval-only pass over a dataloader.
 
@@ -170,7 +171,8 @@ def evaluate_retrieval_loader(
     Returns:
         Retrieval metric dict from :func:`compute_retrieval_metrics`.
     """
-    tag_gallery = embed_all_tag_embeddings(model, vocab, device=device)
+    if tag_gallery is None:
+        tag_gallery = embed_all_tag_embeddings(model, vocab, device=device)
     if tag_gallery is None:
         return _empty_metrics((1, 5, 10), (1, 5))
 
@@ -179,6 +181,8 @@ def evaluate_retrieval_loader(
     pos_mask_batches: list[torch.Tensor] = []
 
     model.eval()
+    unwrapped = _unwrap_model(model)
+    visual_encoder = getattr(unwrapped, "encode_visual_embeddings", None)
     progress = tqdm(
         dataloader,
         desc=desc,
@@ -187,11 +191,14 @@ def evaluate_retrieval_loader(
         leave=False,
         disable=not show_progress,
     )
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in progress:
             batch = _move_batch_to_device(batch, device)
-            out = model(batch)
-            visual_emb = out.get("visual_emb")
+            if visual_encoder is not None:
+                visual_emb = visual_encoder(batch)
+            else:
+                out = model(batch)
+                visual_emb = out.get("visual_emb")
             if visual_emb is None:
                 continue
             visual_batches.append(visual_emb.detach().cpu())

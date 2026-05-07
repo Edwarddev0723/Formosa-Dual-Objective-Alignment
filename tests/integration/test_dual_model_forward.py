@@ -42,6 +42,26 @@ class _FakeMerger(nn.Module):
         return out
 
 
+class _FakeVision(nn.Module):
+    """Callable visual tower stub with a Qwen-like merger child."""
+
+    def __init__(self, d_lm=64, output_dtype=None):
+        super().__init__()
+        self.d_lm = d_lm
+        self.merger = _FakeMerger(d_lm=d_lm, output_dtype=output_dtype)
+
+    def forward(self, pixel_values, grid_thw=None):
+        B = pixel_values.size(0)
+        dummy_tokens = torch.randn(
+            B,
+            6,
+            self.d_lm,
+            device=pixel_values.device,
+            dtype=torch.float32,
+        )
+        return self.merger(dummy_tokens)
+
+
 class _FakeBackbone(nn.Module):
     """Minimal backbone stub that returns HF-style output."""
 
@@ -49,20 +69,19 @@ class _FakeBackbone(nn.Module):
         super().__init__()
         self.d_lm = d_lm
         self.V = V
+        self.forward_calls = 0
         # Expose config.hidden_size so DualObjectiveModel._resolve_hidden_size() works.
         self.config = types.SimpleNamespace(hidden_size=d_lm, text_config=None)
         # Minimal LoRA-ish parameter for param-group detection
         self.lora_A = nn.Parameter(torch.randn(4, d_lm))
         # Merger module: its forward will be called by our stub to trigger the hook
-        self.visual = types.SimpleNamespace(
-            merger=_FakeMerger(d_lm=d_lm, output_dtype=visual_output_dtype)
-        )
+        self.visual = _FakeVision(d_lm=d_lm, output_dtype=visual_output_dtype)
 
     def forward(self, input_ids, attention_mask, labels, pixel_values, **kwargs):
+        self.forward_calls += 1
         B, L = input_ids.shape
         # Simulate merger output to trigger forward hook registered by DualObjectiveModel
-        dummy_tokens = torch.randn(B, 6, self.d_lm)
-        _ = self.visual.merger(dummy_tokens)  # fires the hook
+        _ = self.visual(pixel_values, grid_thw=kwargs.get("image_grid_thw"))
         return _FakeOutput(B, L, self.V)
 
 
@@ -247,3 +266,17 @@ def test_forward_casts_bf16_visual_tokens_to_aux_dtype(tmp_path):
 
     assert out["visual_emb"] is not None
     assert out["visual_emb"].dtype == next(model.pooler.parameters()).dtype
+
+
+def test_encode_visual_embeddings_bypasses_lm_forward(tmp_path):
+    """Retrieval eval can encode images without computing LM logits/loss."""
+    cfg = _make_run_config(contrastive_enabled=True)
+    vocab = _make_vocab(tmp_path)
+    model = _build_stub_model(cfg, vocab, tmp_path, visual_output_dtype=torch.bfloat16)
+    batch = _make_batch(B=2)
+
+    visual_emb = model.encode_visual_embeddings(batch)
+
+    assert visual_emb is not None
+    assert visual_emb.shape == (2, cfg.aux.proj_dim)
+    assert model.backbone.forward_calls == 0
