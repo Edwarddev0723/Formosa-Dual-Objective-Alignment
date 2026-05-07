@@ -45,9 +45,10 @@ class _FakeMerger(nn.Module):
 class _FakeVision(nn.Module):
     """Callable visual tower stub with a Qwen-like merger child."""
 
-    def __init__(self, d_lm=64, output_dtype=None):
+    def __init__(self, d_lm=64, output_dtype=None, return_unmerged=False):
         super().__init__()
         self.d_lm = d_lm
+        self.return_unmerged = return_unmerged
         self.merger = _FakeMerger(d_lm=d_lm, output_dtype=output_dtype)
 
     def forward(self, pixel_values, grid_thw=None):
@@ -59,13 +60,27 @@ class _FakeVision(nn.Module):
             device=pixel_values.device,
             dtype=torch.float32,
         )
-        return self.merger(dummy_tokens)
+        merged = self.merger(dummy_tokens)
+        if self.return_unmerged:
+            return torch.randn(
+                B * 24,
+                self.d_lm,
+                device=pixel_values.device,
+                dtype=torch.float32,
+            )
+        return merged
 
 
 class _FakeBackbone(nn.Module):
     """Minimal backbone stub that returns HF-style output."""
 
-    def __init__(self, d_lm=64, V=1000, visual_output_dtype=None):
+    def __init__(
+        self,
+        d_lm=64,
+        V=1000,
+        visual_output_dtype=None,
+        visual_return_unmerged=False,
+    ):
         super().__init__()
         self.d_lm = d_lm
         self.V = V
@@ -75,7 +90,11 @@ class _FakeBackbone(nn.Module):
         # Minimal LoRA-ish parameter for param-group detection
         self.lora_A = nn.Parameter(torch.randn(4, d_lm))
         # Merger module: its forward will be called by our stub to trigger the hook
-        self.visual = _FakeVision(d_lm=d_lm, output_dtype=visual_output_dtype)
+        self.visual = _FakeVision(
+            d_lm=d_lm,
+            output_dtype=visual_output_dtype,
+            return_unmerged=visual_return_unmerged,
+        )
 
     def forward(self, input_ids, attention_mask, labels, pixel_values, **kwargs):
         self.forward_calls += 1
@@ -145,12 +164,22 @@ def _make_vocab(tmp_path, n_tags=8):
 # ---------------------------------------------------------------------------
 
 
-def _build_stub_model(cfg, vocab, tmp_path, visual_output_dtype=None):
+def _build_stub_model(
+    cfg,
+    vocab,
+    tmp_path,
+    visual_output_dtype=None,
+    visual_return_unmerged=False,
+):
     """Build a DualObjectiveModel with faked-out backbone and TagProjector."""
     import formosa_dual.models.dual_model as dm
     import formosa_dual.models.tag_projector as tp
 
-    fake_backbone = _FakeBackbone(d_lm=64, visual_output_dtype=visual_output_dtype)
+    fake_backbone = _FakeBackbone(
+        d_lm=64,
+        visual_output_dtype=visual_output_dtype,
+        visual_return_unmerged=visual_return_unmerged,
+    )
     fake_processor = MagicMock()
 
     # TagProjector mock: get_tag_embeddings returns zero tensor of correct shape
@@ -273,6 +302,26 @@ def test_encode_visual_embeddings_bypasses_lm_forward(tmp_path):
     cfg = _make_run_config(contrastive_enabled=True)
     vocab = _make_vocab(tmp_path)
     model = _build_stub_model(cfg, vocab, tmp_path, visual_output_dtype=torch.bfloat16)
+    batch = _make_batch(B=2)
+
+    visual_emb = model.encode_visual_embeddings(batch)
+
+    assert visual_emb is not None
+    assert visual_emb.shape == (2, cfg.aux.proj_dim)
+    assert model.backbone.forward_calls == 0
+
+
+def test_encode_visual_embeddings_prefers_merger_hook_over_visual_return(tmp_path):
+    """Direct visual calls use merger-hook tokens when visual() returns another tensor."""
+    cfg = _make_run_config(contrastive_enabled=True)
+    vocab = _make_vocab(tmp_path)
+    model = _build_stub_model(
+        cfg,
+        vocab,
+        tmp_path,
+        visual_output_dtype=torch.bfloat16,
+        visual_return_unmerged=True,
+    )
     batch = _make_batch(B=2)
 
     visual_emb = model.encode_visual_embeddings(batch)

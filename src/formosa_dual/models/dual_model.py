@@ -90,6 +90,7 @@ class DualObjectiveModel(nn.Module):
         # Forward hook to capture visual merger output
         # ----------------------------------------------------------------
         self._cached_visual_tokens: torch.Tensor | None = None
+        self._warned_visual_direct_fallback = False
         self._hook_handle = self._register_merger_hook()
 
         # ----------------------------------------------------------------
@@ -227,7 +228,10 @@ class DualObjectiveModel(nn.Module):
         visual_tokens = self._extract_visual_tokens_direct(batch)
         if visual_tokens is None:
             return self.forward(batch).get("visual_emb")
-        return self._visual_tokens_to_embedding(batch, visual_tokens)
+        try:
+            return self._visual_tokens_to_embedding(batch, visual_tokens)
+        except (RuntimeError, ValueError) as exc:
+            return self._fallback_to_full_forward_for_visual(batch, exc)
 
     def _extract_visual_tokens_direct(self, batch: dict) -> torch.Tensor | None:
         """Call the Qwen visual tower directly when its module is reachable."""
@@ -236,19 +240,38 @@ class DualObjectiveModel(nn.Module):
         if visual is None or pixel_values is None or not callable(visual):
             return None
 
+        self._cached_visual_tokens = None
         pixel_values = self._cast_pixel_values_for_visual(pixel_values, visual)
         image_grid_thw = batch.get("image_grid_thw")
         try:
             if image_grid_thw is not None:
-                return visual(pixel_values, grid_thw=image_grid_thw)
-            return visual(pixel_values)
+                visual_out = visual(pixel_values, grid_thw=image_grid_thw)
+            else:
+                visual_out = visual(pixel_values)
         except TypeError:
             if image_grid_thw is None:
                 return None
-        try:
-            return visual(pixel_values, image_grid_thw=image_grid_thw)
-        except TypeError:
-            return None
+            try:
+                visual_out = visual(pixel_values, image_grid_thw=image_grid_thw)
+            except TypeError:
+                return None
+
+        if self._cached_visual_tokens is not None:
+            return self._cached_visual_tokens
+        return visual_out
+
+    def _fallback_to_full_forward_for_visual(
+        self, batch: dict, reason: Exception
+    ) -> torch.Tensor | None:
+        """Use the full model forward when direct visual encoding is not compatible."""
+        if not self._warned_visual_direct_fallback:
+            logger.warning(
+                "Visual-only retrieval path failed; falling back to full model forward. "
+                "Lower --batch-size if this causes OOM. Reason: %s",
+                reason,
+            )
+            self._warned_visual_direct_fallback = True
+        return self.forward(batch).get("visual_emb")
 
     def _get_visual_module(self):
         """Return the callable visual encoder module under common PEFT/Qwen paths."""
@@ -320,6 +343,15 @@ class DualObjectiveModel(nn.Module):
                 per_img = (
                     thw[:, 0] * thw[:, 1] * thw[:, 2] // (merge * merge)
                 ).tolist()
+                expected_tokens = int(sum(per_img))
+                actual_tokens = int(visual_tokens.size(0))
+                if actual_tokens != expected_tokens:
+                    raw_per_img = (thw[:, 0] * thw[:, 1] * thw[:, 2]).tolist()
+                    raise ValueError(
+                        "visual token count does not match post-merger image grid: "
+                        f"actual={actual_tokens}, expected={expected_tokens}, "
+                        f"raw_grid_sum={int(sum(raw_per_img))}, per_img={per_img}"
+                    )
                 chunks = list(torch.split(visual_tokens, per_img, dim=0))
                 max_n = max(c.size(0) for c in chunks)
                 padded = torch.zeros(
@@ -332,6 +364,16 @@ class DualObjectiveModel(nn.Module):
                 for i, c in enumerate(chunks):
                     padded[i, : c.size(0)] = c
                 visual_tokens = padded
+        elif visual_tokens.dim() == 3:
+            if visual_tokens.size(0) != B:
+                raise ValueError(
+                    "batched visual tokens disagree with batch size: "
+                    f"tokens={tuple(visual_tokens.shape)}, batch_size={B}"
+                )
+        else:
+            raise ValueError(
+                f"visual tokens must be [N,d] or [B,N,d], got {tuple(visual_tokens.shape)}"
+            )
 
         pooler_dtype = next(self.pooler.parameters()).dtype
         if visual_tokens.dtype != pooler_dtype:
