@@ -6,6 +6,7 @@ Tests verify:
 - visual_emb is None when contrastive disabled
 - get_trainable_param_groups returns named groups
 """
+
 from __future__ import annotations
 
 import types
@@ -14,7 +15,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
-
 
 # ---------------------------------------------------------------------------
 # Helpers: stub backbone + config
@@ -27,10 +27,25 @@ class _FakeOutput:
         self.loss = torch.tensor(1.5)
 
 
+class _FakeMerger(nn.Module):
+    """Merger stub that can emit a requested dtype, mirroring bf16 Qwen outputs."""
+
+    def __init__(self, d_lm=64, output_dtype=None):
+        super().__init__()
+        self.proj = nn.Linear(d_lm, d_lm, bias=False)
+        self.output_dtype = output_dtype
+
+    def forward(self, x):
+        out = self.proj(x)
+        if self.output_dtype is not None:
+            out = out.to(self.output_dtype)
+        return out
+
+
 class _FakeBackbone(nn.Module):
     """Minimal backbone stub that returns HF-style output."""
 
-    def __init__(self, d_lm=64, V=1000):
+    def __init__(self, d_lm=64, V=1000, visual_output_dtype=None):
         super().__init__()
         self.d_lm = d_lm
         self.V = V
@@ -40,7 +55,7 @@ class _FakeBackbone(nn.Module):
         self.lora_A = nn.Parameter(torch.randn(4, d_lm))
         # Merger module: its forward will be called by our stub to trigger the hook
         self.visual = types.SimpleNamespace(
-            merger=nn.Linear(d_lm, d_lm, bias=False)
+            merger=_FakeMerger(d_lm=d_lm, output_dtype=visual_output_dtype)
         )
 
     def forward(self, input_ids, attention_mask, labels, pixel_values, **kwargs):
@@ -63,8 +78,7 @@ def _make_run_config(*, contrastive_enabled: bool = True):
         unfreeze_vit_last_n=0,
     )
     lora_cfg = types.SimpleNamespace(
-        enabled=False,
-        r=4, alpha=8, dropout=0.0, target_modules=["q_proj"], bias="none"
+        enabled=False, r=4, alpha=8, dropout=0.0, target_modules=["q_proj"], bias="none"
     )
     aux_cfg = types.SimpleNamespace(
         proj_dim=32,
@@ -77,8 +91,11 @@ def _make_run_config(*, contrastive_enabled: bool = True):
         tau=0.07,
     )
     optim_cfg = types.SimpleNamespace(
-        lr_lora=1e-4, weight_decay_lora=0.01,
-        lr_aux=1e-3, weight_decay_aux=0.0, weight_decay_tag_proj=0.0,
+        lr_lora=1e-4,
+        weight_decay_lora=0.01,
+        lr_aux=1e-3,
+        weight_decay_aux=0.0,
+        weight_decay_tag_proj=0.0,
     )
     return types.SimpleNamespace(
         model=model_cfg,
@@ -92,9 +109,15 @@ def _make_run_config(*, contrastive_enabled: bool = True):
 def _make_vocab(tmp_path, n_tags=8):
     import json
     from formosa_dual.data.tag_vocab import TagVocabulary
-    tags = [{"id": i, "tag": f"tag_{i}", "tier": 1, "freq": 5, "category": "test"} for i in range(n_tags)]
+
+    tags = [
+        {"id": i, "tag": f"tag_{i}", "tier": 1, "freq": 5, "category": "test"}
+        for i in range(n_tags)
+    ]
     p = tmp_path / "vocab.json"
-    p.write_text(json.dumps({"version": "v1", "size": n_tags, "tags": tags}), encoding="utf-8")
+    p.write_text(
+        json.dumps({"version": "v1", "size": n_tags, "tags": tags}), encoding="utf-8"
+    )
     return TagVocabulary(p)
 
 
@@ -103,12 +126,12 @@ def _make_vocab(tmp_path, n_tags=8):
 # ---------------------------------------------------------------------------
 
 
-def _build_stub_model(cfg, vocab, tmp_path):
+def _build_stub_model(cfg, vocab, tmp_path, visual_output_dtype=None):
     """Build a DualObjectiveModel with faked-out backbone and TagProjector."""
     import formosa_dual.models.dual_model as dm
     import formosa_dual.models.tag_projector as tp
 
-    fake_backbone = _FakeBackbone(d_lm=64)
+    fake_backbone = _FakeBackbone(d_lm=64, visual_output_dtype=visual_output_dtype)
     fake_processor = MagicMock()
 
     # TagProjector mock: get_tag_embeddings returns zero tensor of correct shape
@@ -123,7 +146,10 @@ def _build_stub_model(cfg, vocab, tmp_path):
 
     # Patch at the locations dual_model.py actually calls
     with (
-        patch("formosa_dual.models.dual_model.load_backbone", return_value=(fake_backbone, fake_processor)),
+        patch(
+            "formosa_dual.models.dual_model.load_backbone",
+            return_value=(fake_backbone, fake_processor),
+        ),
         patch("formosa_dual.models.dual_model.apply_freeze_policy", return_value=None),
         patch("formosa_dual.models.tag_projector.TagProjector", _FakeTagProjector),
     ):
@@ -167,7 +193,14 @@ def test_forward_keys_present(model_with_contrastive):
     model, _ = model_with_contrastive
     batch = _make_batch()
     out = model(batch)
-    for key in ("lm_logits", "lm_loss", "visual_emb", "tag_pos_emb", "tag_neg_emb", "pos_tag_mask"):
+    for key in (
+        "lm_logits",
+        "lm_loss",
+        "visual_emb",
+        "tag_pos_emb",
+        "tag_neg_emb",
+        "pos_tag_mask",
+    ):
         assert key in out, f"Missing key: {key}"
 
 
@@ -201,3 +234,16 @@ def test_lm_loss_is_scalar(model_with_contrastive):
     batch = _make_batch()
     out = model(batch)
     assert out["lm_loss"].shape == ()
+
+
+def test_forward_casts_bf16_visual_tokens_to_aux_dtype(tmp_path):
+    """bf16 visual tokens are cast to fp32 aux-module dtype before pooling."""
+    cfg = _make_run_config(contrastive_enabled=True)
+    vocab = _make_vocab(tmp_path)
+    model = _build_stub_model(cfg, vocab, tmp_path, visual_output_dtype=torch.bfloat16)
+    batch = _make_batch(B=2)
+
+    out = model(batch)
+
+    assert out["visual_emb"] is not None
+    assert out["visual_emb"].dtype == next(model.pooler.parameters()).dtype

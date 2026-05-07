@@ -302,6 +302,9 @@ class DualObjectiveModel(nn.Module):
 
             # Pool visual tokens → [B, d_lm]
             # ASSUMPTION: no mask available here; treat all tokens as valid
+            pooler_dtype = next(self.pooler.parameters()).dtype
+            if visual_tokens.dtype != pooler_dtype:
+                visual_tokens = visual_tokens.to(dtype=pooler_dtype)
             pooled = self.pooler(visual_tokens)  # [B, d_lm]
             visual_emb = self.proj_head(pooled)  # [B, proj_dim]
 
